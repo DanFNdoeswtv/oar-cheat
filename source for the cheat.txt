@@ -1,0 +1,3364 @@
+// language: C++, file: dllmain.cpp, target: Windows x64, UE4 4.27.2-18319896, MSVC
+// deps: MinHook, ImGui (win32+dx11), d3d11.lib, dxgi.lib, shellapi.lib
+// build: x64 Release, /std:c++20, /MD, /EHa
+// preprocessor: WIN32_LEAN_AND_MEAN, NOMINMAX, _CRT_SECURE_NO_WARNINGS
+
+#include <Windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstdarg>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <shellapi.h>
+
+#include <MinHook.h>
+#include <imgui.h>
+#include <imgui_impl_dx11.h>
+#include <imgui_impl_win32.h>
+
+extern LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+int g_screen_w = 1920;
+int g_screen_h = 1080;
+
+static ID3D11Device* g_dev = nullptr;
+static ID3D11DeviceContext* g_ctx = nullptr;
+static ID3D11RenderTargetView* g_rtv = nullptr;
+static HWND                    g_hwnd = nullptr;
+
+#define CHEAT_NAME "femboy hacks"
+
+namespace build_info {
+    inline const char* VERSION = "v0.4.1";
+    inline const char* BUILD_ID = __DATE__ " " __TIME__;
+}
+
+namespace silent { inline float pitch = 0.f; inline float yaw = 0.f; inline bool valid = false; }
+
+// ============================================================
+// PATHS
+// ============================================================
+namespace paths {
+    inline std::string g_data_dir;
+    inline bool        g_resolved = false;
+    inline bool dir_exists(const char* p) {
+        DWORD a = GetFileAttributesA(p);
+        return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+    }
+    inline bool ensure_dir(const std::string& p) {
+        if (p.empty()) return false;
+        if (dir_exists(p.c_str())) return true;
+        CreateDirectoryA(p.c_str(), nullptr);
+        return dir_exists(p.c_str());
+    }
+    inline std::string folder_name() {
+        char user[64]{};
+        if (!GetEnvironmentVariableA("USERNAME", user, sizeof(user))) strcpy_s(user, "user");
+        return std::string("oar femboy hacks - ") + user;
+    }
+    inline const std::string& data_dir() {
+        if (g_resolved) return g_data_dir;
+        g_resolved = true;
+        const std::string kFolder = folder_name();
+        char buf[MAX_PATH]{};
+        { std::string p = std::string("C:\\") + kFolder; if (ensure_dir(p)) { g_data_dir = p; return g_data_dir; } }
+        if (GetTempPathA(MAX_PATH, buf) > 0 && buf[0]) {
+            std::string p = buf;
+            if (!p.empty() && p.back() == '\\') p.pop_back();
+            p += "\\"; p += kFolder;
+            if (ensure_dir(p)) { g_data_dir = p; return g_data_dir; }
+        }
+        if (GetEnvironmentVariableA("APPDATA", buf, MAX_PATH) > 0 && buf[0]) {
+            std::string p = buf; p += "\\"; p += kFolder;
+            if (ensure_dir(p)) { g_data_dir = p; return g_data_dir; }
+        }
+        if (GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH) > 0 && buf[0]) {
+            std::string p = buf; p += "\\"; p += kFolder;
+            if (ensure_dir(p)) { g_data_dir = p; return g_data_dir; }
+        }
+        return g_data_dir;
+    }
+    inline std::string log_path() {
+        const std::string& d = data_dir();
+        if (d.empty()) return {};
+        return d + "\\oar_debug.txt";
+    }
+    inline std::string sanitize_name(const std::string& in) {
+        std::string s = in.empty() ? "default" : in;
+        for (auto& c : s) {
+            if (c == '\\' || c == '/' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<' || c == '>' || c == '|' || c == '\n' ||
+                c == '\r' || c == '\t') c = '_';
+        }
+        if (s.size() > 64) s.resize(64);
+        return s;
+    }
+    inline std::string config_path(const std::string& name) {
+        const std::string& d = data_dir();
+        if (d.empty()) return {};
+        return d + "\\" + sanitize_name(name) + ".cfg";
+    }
+    inline std::string dump_path(const char* name) {
+        const std::string& d = data_dir();
+        if (d.empty()) return {};
+        return d + "\\" + name;
+    }
+    inline bool write_all(const std::string& path, const std::string& content) {
+        if (path.empty()) return false;
+        HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        const char* p = content.data();
+        DWORD rem = (DWORD)content.size();
+        while (rem > 0) {
+            DWORD w = 0;
+            if (!WriteFile(h, p, rem, &w, nullptr) || w == 0) { CloseHandle(h); return false; }
+            p += w; rem -= w;
+        }
+        CloseHandle(h);
+        return true;
+    }
+    inline bool read_all(const std::string& path, std::string& out) {
+        out.clear();
+        if (path.empty()) return false;
+        HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        DWORD size = GetFileSize(h, nullptr);
+        if (size == INVALID_FILE_SIZE) { CloseHandle(h); return false; }
+        out.resize(size);
+        DWORD rd = 0;
+        if (size > 0) {
+            if (!ReadFile(h, out.data(), size, &rd, nullptr)) { CloseHandle(h); out.clear(); return false; }
+            out.resize(rd);
+        }
+        CloseHandle(h);
+        return true;
+    }
+} // namespace paths
+
+// ============================================================
+// DIAG
+// ============================================================
+static void open_console() {
+    if (!AllocConsole()) return;
+    SetConsoleTitleA(CHEAT_NAME);
+    FILE* f = nullptr;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    freopen_s(&f, "CONIN$", "r", stdin);
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(h, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+    std::ios::sync_with_stdio();
+}
+static void dbg(const char* fmt, ...) {
+    char buf[2048];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    const std::string& lp = paths::log_path();
+    if (!lp.empty()) {
+        HANDLE h = CreateFileA(lp.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD w = 0;
+            WriteFile(h, buf, (DWORD)strlen(buf), &w, nullptr);
+            WriteFile(h, "\r\n", 2, &w, nullptr);
+            CloseHandle(h);
+        }
+    }
+    OutputDebugStringA(buf); OutputDebugStringA("\n");
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (out && out != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(out, buf, (DWORD)strlen(buf), &w, nullptr);
+        WriteFile(out, "\r\n", 2, &w, nullptr);
+    }
+}
+static void dbg_to(const std::string& path, const char* fmt, ...) {
+    if (path.empty()) return;
+    char buf[2048];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    HANDLE h = CreateFileA(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD w = 0;
+    WriteFile(h, buf, (DWORD)strlen(buf), &w, nullptr);
+    WriteFile(h, "\r\n", 2, &w, nullptr);
+    CloseHandle(h);
+    OutputDebugStringA(buf); OutputDebugStringA("\n");
+}
+static void dbg_to_begin(const std::string& path) {
+    if (path.empty()) return;
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+static bool copy_to_clipboard(const char* text) {
+    if (!text) return false;
+    size_t len = strlen(text) + 1;
+    if (!OpenClipboard(nullptr)) return false;
+    EmptyClipboard();
+    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, len);
+    if (!hMem) { CloseClipboard(); return false; }
+    void* dst = GlobalLock(hMem);
+    if (!dst) { GlobalFree(hMem); CloseClipboard(); return false; }
+    memcpy(dst, text, len);
+    GlobalUnlock(hMem);
+    SetClipboardData(CF_TEXT, hMem);
+    CloseClipboard();
+    return true;
+}
+
+// ============================================================
+// SAFE MEMORY
+// ============================================================
+static bool smemcpy(void* dst, const void* src, size_t n) {
+    __try { memcpy(dst, src, n); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+typedef void (*seh_fn_t)();
+__declspec(noinline) static bool seh_guard(seh_fn_t fn) {
+    __try { fn(); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+inline bool sane_ptr(const void* p) {
+    auto v = reinterpret_cast<uintptr_t>(p);
+    if (v == 0 || v < 0x10000 || v > 0x7FFF'FFFF'0000ULL) return false;
+    return true;
+}
+static uintptr_t safe_read_uintptr(void* base, uintptr_t off) {
+    if (!sane_ptr(base)) return 0;
+    uintptr_t v = 0;
+    if (!smemcpy(&v, reinterpret_cast<uint8_t*>(base) + off, sizeof(v))) return 0;
+    if (!sane_ptr(reinterpret_cast<void*>(v))) return 0;
+    return v;
+}
+static int32_t safe_read_i32(void* base, uintptr_t off) {
+    if (!sane_ptr(base)) return 0;
+    int32_t v = 0; smemcpy(&v, reinterpret_cast<uint8_t*>(base) + off, sizeof(v)); return v;
+}
+static float safe_read_f32(void* base, uintptr_t off) {
+    if (!sane_ptr(base)) return 0.f;
+    float v = 0.f; smemcpy(&v, reinterpret_cast<uint8_t*>(base) + off, sizeof(v)); return v;
+}
+static bool safe_write_f32(void* base, uintptr_t off, float v) {
+    if (!sane_ptr(base)) return false;
+    return smemcpy(reinterpret_cast<uint8_t*>(base) + off, &v, sizeof(v));
+}
+static bool safe_write_i32(void* base, uintptr_t off, int32_t v) {
+    if (!sane_ptr(base)) return false;
+    return smemcpy(reinterpret_cast<uint8_t*>(base) + off, &v, sizeof(v));
+}
+static bool safe_write_u8(void* base, uintptr_t off, uint8_t v) {
+    if (!sane_ptr(base)) return false;
+    return smemcpy(reinterpret_cast<uint8_t*>(base) + off, &v, sizeof(v));
+}
+static uint8_t safe_read_u8(void* base, uintptr_t off) {
+    if (!sane_ptr(base)) return 0;
+    uint8_t v = 0; smemcpy(&v, reinterpret_cast<uint8_t*>(base) + off, sizeof(v)); return v;
+}
+
+// ============================================================
+// UE4 OFFSETS
+// ============================================================
+namespace off {
+    inline uintptr_t GObjects = 0x04B0ABD0;
+    inline uintptr_t GNames = 0x04ACE880;
+    inline uintptr_t GWorld = 0x04C52570;
+    inline uintptr_t ProcessEvent = 0x011E78D0;
+    inline uintptr_t AppendString = 0x00FF7110;
+    inline uintptr_t UWorld_OwningGameInstance = 0x180;
+    inline uintptr_t UWorld_GameState = 0x120;
+    inline uintptr_t UGameInstance_LocalPlayers = 0x038;
+    inline uintptr_t ULocalPlayer_PlayerController = 0x030;
+    inline uintptr_t APlayerController_AcknowledgedPawn = 0x2A0;
+    inline uintptr_t APlayerController_PlayerCameraManager = 0x2B8;
+    inline uintptr_t APlayerController_ControlRotation = 0x288;
+    inline uintptr_t APlayerCameraManager_CameraCachePrivate = 0x1AE0;
+    inline uintptr_t AActor_RootComponent = 0x130;
+    inline uintptr_t USceneComponent_RelativeLocation = 0x11C;
+    inline uintptr_t UWorld_PersistentLevel = 0x30;
+    inline uintptr_t UObject_Class = 0x10;
+    inline uintptr_t UObject_Name = 0x18;
+    inline uintptr_t UStruct_SuperStruct = 0x40;
+    inline uintptr_t UStruct_Children = 0x48;
+    inline uintptr_t UField_Next = 0x28;
+    inline uintptr_t UFunction_Func = 0xD8;
+    inline uintptr_t APlayerCharacter_HoldingGun = 0x5A8;
+    inline uintptr_t APlayerCharacter_Health = 0x6B0;
+    inline uintptr_t APlayerCharacter_MaxHealth = 0x834;
+    inline uintptr_t APlayerCharacter_GunAmmos = 0x670;
+    inline uintptr_t APlayerCharacter_ReserveAmmo = 0x680;
+    inline uintptr_t APlayerCharacter_AlphaRecoilAlpha = 0x570;
+    inline uintptr_t ACharacter_CharacterMovement = 0x288;
+    inline uintptr_t ACharacter_Mesh = 0x290;
+    inline uintptr_t UCharMove_MovementMode = 0x0168;
+    inline uintptr_t UCharMove_CustomMovementMode = 0x0169;
+    inline uintptr_t UCharMove_MaxFlySpeed = 0x0198;
+    inline uintptr_t UCharMove_bCheatFlying_Byte = 0x0388;
+    inline uintptr_t GunBase_RecoilStrength = 0x2D0;
+    inline uintptr_t GunBase_GunKickMultiplier = 0x2D4;
+    inline uintptr_t GunBase_Accuracy = 0x314;
+    inline uintptr_t GunBase_AddedSpread = 0x330;
+    inline uintptr_t GunBase_CoolDownTime = 0x2C8;
+    inline uintptr_t GunBase_BulletsLeft = 0x2DC;
+    inline uintptr_t GunBase_MagSize = 0x2D8;
+    inline uintptr_t GunBase_CanShoot = 0x2CC;
+    inline uintptr_t RobberController_Level = 0x05B8;
+    inline uintptr_t RobberController_Exp = 0x05BC;
+    inline uintptr_t RobberController_Cash = 0x05C0;
+    inline uintptr_t RobberController_Coins = 0x0738;
+    inline uintptr_t RobberController_UnlockedMaps = 0x0750;
+    inline uintptr_t Savegame_CashSave = 0x00A8;
+    inline uintptr_t Savegame_LevelSave = 0x00AC;
+    inline uintptr_t Savegame_EXPSave = 0x00B0;
+    inline uintptr_t Savegame_MapsSave = 0x00E8;
+}
+
+namespace ue4 {
+    inline uintptr_t base = 0;
+    template<typename T> struct TArray { T* data; int32_t num; int32_t max; };
+    struct FName { int32_t comparison_index; uint32_t number; };
+    struct FString { wchar_t* data; int32_t num; int32_t max; };
+    struct UObject {
+        void** vft; uint8_t _pad[4]; uint32_t flags; int32_t index;
+        UObject* uclass; FName fname; UObject* outer;
+    };
+    using AppendStringFn = void(__fastcall*)(const FName*, FString*);
+    inline AppendStringFn g_append_string = nullptr;
+    using ProcessEventFn = void(*)(UObject*, UObject*, void*);
+    inline ProcessEventFn g_process_event = nullptr;
+
+    namespace name_cache {
+        struct Entry { int32_t idx = 0; uint32_t num = 0; std::string str; };
+        inline Entry g_entries[2048] = {};
+        inline int   g_next = 0;
+        inline std::string raw_name_to_string(int32_t idx, uint32_t num) {
+            if (!g_append_string) return {};
+            if (idx <= 0 || idx >= 5'000'000) return {};
+            FName fn{ idx, num };
+            FString out{};
+            g_append_string(&fn, &out);
+            if (!out.data || out.num <= 1 || out.num > 4096) return {};
+            int len = WideCharToMultiByte(CP_UTF8, 0, out.data, out.num - 1, nullptr, 0, nullptr, nullptr);
+            if (len <= 0) return {};
+            std::string s(len, 0);
+            WideCharToMultiByte(CP_UTF8, 0, out.data, out.num - 1, s.data(), len, nullptr, nullptr);
+            return s;
+        }
+        inline const std::string& get(int32_t idx, uint32_t num) {
+            static std::string empty;
+            if (idx <= 0 || idx >= 5'000'000) return empty;
+            for (int i = 0; i < 2048; ++i) {
+                const Entry& e = g_entries[i];
+                if (e.idx == idx && e.num == num && !e.str.empty()) return e.str;
+            }
+            Entry& e = g_entries[g_next];
+            g_next = (g_next + 1) % 2048;
+            e.idx = idx; e.num = num;
+            e.str = raw_name_to_string(idx, num);
+            return e.str;
+        }
+    }
+    inline std::string name_to_string(FName name) {
+        return name_cache::raw_name_to_string(name.comparison_index, name.number);
+    }
+    inline const std::string& name_to_string_cached(const FName& name) {
+        return name_cache::get(name.comparison_index, name.number);
+    }
+    inline const std::string& cached_name_of(UObject* o) {
+        static std::string empty;
+        if (!sane_ptr(o)) return empty;
+        FName fn{};
+        if (!smemcpy(&fn, reinterpret_cast<uint8_t*>(o) + off::UObject_Name, sizeof(fn))) return empty;
+        return name_cache::get(fn.comparison_index, fn.number);
+    }
+    inline std::string class_name_of(UObject* o) {
+        if (!sane_ptr(o)) return {};
+        uintptr_t cls = safe_read_uintptr(o, off::UObject_Class);
+        if (!sane_ptr(reinterpret_cast<void*>(cls))) return {};
+        FName n{};
+        if (!smemcpy(&n, reinterpret_cast<void*>(cls + off::UObject_Name), sizeof(n))) return {};
+        return name_cache::raw_name_to_string(n.comparison_index, n.number);
+    }
+    // matches Class, BlueprintGeneratedClass, WidgetBlueprintGeneratedClass, etc.
+    inline bool is_class_object(UObject* o) {
+        std::string cn = class_name_of(o);
+        if (cn.empty()) return false;
+        return cn.find("Class") != std::string::npos;
+    }
+    template<typename Fn>
+    inline void for_each_object(Fn cb) {
+        uintptr_t arr = base + off::GObjects;
+        uintptr_t cptr = safe_read_uintptr(reinterpret_cast<void*>(arr), 0);
+        if (!sane_ptr(reinterpret_cast<void*>(cptr))) return;
+        int32_t num = safe_read_i32(reinterpret_cast<void*>(arr), 0x14);
+        int32_t chunks = safe_read_i32(reinterpret_cast<void*>(arr), 0x1C);
+        if (num <= 0 || chunks <= 0 || num > 5'000'000) return;
+        const int32_t kChunkSize = 0x10000;
+        const uintptr_t kStride = 0x18;
+        for (int32_t ci = 0; ci < chunks; ++ci) {
+            uintptr_t chunk = safe_read_uintptr(reinterpret_cast<void*>(cptr), ci * 8);
+            if (!sane_ptr(reinterpret_cast<void*>(chunk))) continue;
+            int32_t in_chunk = kChunkSize;
+            int32_t rem = num - (ci * kChunkSize);
+            if (rem < in_chunk) in_chunk = rem;
+            if (in_chunk <= 0) break;
+            for (int32_t ii = 0; ii < in_chunk; ++ii) {
+                uintptr_t item = chunk + (kStride * ii);
+                uintptr_t obj = safe_read_uintptr(reinterpret_cast<void*>(item), 0);
+                if (!sane_ptr(reinterpret_cast<void*>(obj))) continue;
+                auto* o = reinterpret_cast<UObject*>(obj);
+                if (!cb(o)) return;
+            }
+        }
+    }
+} // namespace ue4
+
+namespace chain {
+    inline ue4::UObject* world() {
+        auto* w = *reinterpret_cast<ue4::UObject**>(ue4::base + off::GWorld);
+        return sane_ptr(w) ? w : nullptr;
+    }
+    inline ue4::UObject* game_instance() {
+        auto* w = world(); if (!w) return nullptr;
+        uintptr_t p = safe_read_uintptr(w, off::UWorld_OwningGameInstance);
+        return sane_ptr(reinterpret_cast<void*>(p)) ? reinterpret_cast<ue4::UObject*>(p) : nullptr;
+    }
+    inline ue4::UObject* local_player() {
+        auto* gi = game_instance(); if (!gi) return nullptr;
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(gi) + off::UGameInstance_LocalPlayers;
+        int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+        if (n <= 0 || n > 16) return nullptr;
+        uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+        if (!sane_ptr(reinterpret_cast<void*>(data))) return nullptr;
+        uintptr_t first = safe_read_uintptr(reinterpret_cast<void*>(data), 0);
+        return sane_ptr(reinterpret_cast<void*>(first)) ? reinterpret_cast<ue4::UObject*>(first) : nullptr;
+    }
+    inline ue4::UObject* cached_pc = nullptr;
+    inline ue4::UObject* cached_pawn = nullptr;
+    inline ue4::UObject* g_last_world = nullptr;
+    inline void check_world() {
+        auto* w = world();
+        if (w != g_last_world) { g_last_world = w; cached_pc = nullptr; cached_pawn = nullptr; }
+    }
+    inline bool object_alive(ue4::UObject* o) {
+        if (!sane_ptr(o)) return false;
+        return sane_ptr(reinterpret_cast<void*>(safe_read_uintptr(o, off::UObject_Class)));
+    }
+    inline ue4::UObject* local_pc() {
+        check_world();
+        auto* lp = local_player();
+        if (lp) {
+            uintptr_t pc = safe_read_uintptr(lp, off::ULocalPlayer_PlayerController);
+            if (sane_ptr(reinterpret_cast<void*>(pc))) { cached_pc = reinterpret_cast<ue4::UObject*>(pc); return cached_pc; }
+        }
+        if (cached_pc && !object_alive(cached_pc)) cached_pc = nullptr;
+        return cached_pc;
+    }
+    inline ue4::UObject* local_pawn() {
+        check_world();
+        auto* pc = local_pc();
+        if (pc) {
+            uintptr_t p = safe_read_uintptr(pc, off::APlayerController_AcknowledgedPawn);
+            if (sane_ptr(reinterpret_cast<void*>(p))) { cached_pawn = reinterpret_cast<ue4::UObject*>(p); return cached_pawn; }
+        }
+        if (cached_pawn && !object_alive(cached_pawn)) cached_pawn = nullptr;
+        return cached_pawn;
+    }
+    inline ue4::UObject* g_los_fn = nullptr;
+    inline int g_los_state = 0;
+    inline ue4::UObject* find_function_on_class(ue4::UObject* cls, const char* name) {
+        if (!sane_ptr(cls)) return nullptr;
+        uintptr_t child = safe_read_uintptr(cls, off::UStruct_Children);
+        int count = 0;
+        while (child && count++ < 5000) {
+            ue4::FName n{};
+            if (!smemcpy(&n, reinterpret_cast<void*>(child + off::UObject_Name), sizeof(n))) break;
+            const std::string& s = ue4::name_to_string_cached(n);
+            if (!s.empty() && s == name) return reinterpret_cast<ue4::UObject*>(child);
+            child = safe_read_uintptr(reinterpret_cast<void*>(child), off::UField_Next);
+        }
+        return nullptr;
+    }
+    inline ue4::UObject* resolve_on_chain(ue4::UObject* inst, const char* name) {
+        if (!sane_ptr(inst)) return nullptr;
+        uintptr_t cls = safe_read_uintptr(inst, off::UObject_Class);
+        int d = 0;
+        while (cls && d++ < 64) {
+            auto* f = find_function_on_class(reinterpret_cast<ue4::UObject*>(cls), name);
+            if (f) return f;
+            cls = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_SuperStruct);
+        }
+        return nullptr;
+    }
+    inline void init_los() {
+        if (g_los_state == 2 || g_los_state == 1) return;
+        auto* pc = local_pc();
+        if (!pc) return;
+        uintptr_t cls = safe_read_uintptr(pc, off::UObject_Class);
+        int depth = 0;
+        while (cls && depth++ < 32) {
+            auto* fn = find_function_on_class(reinterpret_cast<ue4::UObject*>(cls), "LineOfSightTo");
+            if (fn) { g_los_fn = fn; g_los_state = 2; return; }
+            cls = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_SuperStruct);
+        }
+        g_los_state = 1;
+    }
+    struct LosParams { ue4::UObject* Other; float ViewX, ViewY, ViewZ; bool bAlternateChecks; bool ReturnValue; uint8_t _pad[2]; };
+    inline bool has_line_of_sight(ue4::UObject* pc, ue4::UObject* target, float cx, float cy, float cz) {
+        if (!pc || !target) return false;
+        if (!g_los_fn || !ue4::g_process_event) return true;
+        LosParams p{};
+        p.Other = target; p.ViewX = cx; p.ViewY = cy; p.ViewZ = cz;
+        __try { ue4::g_process_event(pc, g_los_fn, &p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        return p.ReturnValue;
+    }
+    namespace los_cache {
+        struct Entry { ue4::UObject* actor; bool has_los; DWORD frame; };
+        inline Entry g_entries[128] = {};
+        inline DWORD g_frame = 0;
+        inline int   g_next = 0;
+        inline void begin_frame() { g_frame++; }
+        inline int find(ue4::UObject* a) { for (int i = 0; i < 128; ++i) if (g_entries[i].actor == a) return i; return -1; }
+        inline bool peek(ue4::UObject* a, bool& out) {
+            int i = find(a);
+            if (i >= 0 && g_entries[i].frame == g_frame) { out = g_entries[i].has_los; return true; }
+            return false;
+        }
+        inline void put(ue4::UObject* a, bool v) {
+            int i = find(a);
+            if (i < 0) { i = g_next; g_next = (g_next + 1) % 128; g_entries[i].actor = a; }
+            g_entries[i].has_los = v; g_entries[i].frame = g_frame;
+        }
+    }
+    inline bool has_los_cached(ue4::UObject* pc, ue4::UObject* target, float cx, float cy, float cz) {
+        bool cached = false;
+        if (los_cache::peek(target, cached)) return cached;
+        bool r = has_line_of_sight(pc, target, cx, cy, cz);
+        los_cache::put(target, r);
+        return r;
+    }
+} // namespace chain
+
+namespace actors {
+    inline ue4::TArray<ue4::UObject*>* get_actors() {
+        auto* w = chain::world();
+        if (!w) return nullptr;
+        uintptr_t lvl = safe_read_uintptr(w, off::UWorld_PersistentLevel);
+        if (!sane_ptr(reinterpret_cast<void*>(lvl))) return nullptr;
+        static uintptr_t g_good_off = 0;
+        static const uintptr_t candidates[] = { 0x98, 0x28, 0x38, 0xA0, 0x90 };
+        if (g_good_off) {
+            uintptr_t arr_addr = lvl + g_good_off;
+            int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+            if (n > 0 && n < 100000) {
+                uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+                if (sane_ptr(reinterpret_cast<void*>(data)))
+                    return reinterpret_cast<ue4::TArray<ue4::UObject*>*>(arr_addr);
+            }
+            g_good_off = 0;
+        }
+        for (uintptr_t o : candidates) {
+            uintptr_t arr_addr = lvl + o;
+            int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+            if (n < 10 || n > 100000) continue;
+            uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+            if (!sane_ptr(reinterpret_cast<void*>(data))) continue;
+            uintptr_t first = safe_read_uintptr(reinterpret_cast<void*>(data), 0);
+            if (!sane_ptr(reinterpret_cast<void*>(first))) continue;
+            g_good_off = o;
+            return reinterpret_cast<ue4::TArray<ue4::UObject*>*>(arr_addr);
+        }
+        return nullptr;
+    }
+} // namespace actors
+
+namespace esp {
+    struct Vec3 { float x, y, z; };
+    struct Rot { float pitch, yaw, roll; };
+    enum class Cat : int { Skip = 0, Guard, Police, Civilian, Other };
+    struct ClassCacheEntry { uintptr_t cls = 0; bool is_pawn = false; };
+    inline ClassCacheEntry g_class_cache[512] = {};
+    inline int g_class_next = 0;
+    inline bool is_pawn_class_raw(uintptr_t cls) {
+        int depth = 0;
+        while (cls && depth++ < 32) {
+            ue4::FName n{};
+            if (!smemcpy(&n, reinterpret_cast<void*>(cls + off::UObject_Name), sizeof(n))) break;
+            const std::string& name = ue4::name_to_string_cached(n);
+            if (name == "Pawn" || name == "Character") return true;
+            cls = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_SuperStruct);
+        }
+        return false;
+    }
+    inline bool is_pawn_class(ue4::UObject* actor) {
+        if (!sane_ptr(actor)) return false;
+        uintptr_t cls = safe_read_uintptr(actor, off::UObject_Class);
+        if (!sane_ptr(reinterpret_cast<void*>(cls))) return false;
+        for (int i = 0; i < 512; ++i) if (g_class_cache[i].cls == cls) return g_class_cache[i].is_pawn;
+        bool result = is_pawn_class_raw(cls);
+        ClassCacheEntry& e = g_class_cache[g_class_next];
+        g_class_next = (g_class_next + 1) % 512;
+        e.cls = cls; e.is_pawn = result;
+        return result;
+    }
+    inline Cat classify(const std::string& n) {
+        if (n.find("Rat") != std::string::npos) return Cat::Skip;
+        if (n.find("NPC_Guard") != std::string::npos) return Cat::Guard;
+        if (n.find("Guard") != std::string::npos) return Cat::Guard;
+        if (n.find("Security") != std::string::npos) return Cat::Guard;
+        if (n.find("Police") != std::string::npos) return Cat::Police;
+        if (n.find("Cop") != std::string::npos) return Cat::Police;
+        if (n.find("SWAT") != std::string::npos) return Cat::Police;
+        if (n.find("Civilian") != std::string::npos) return Cat::Civilian;
+        if (n.find("Civ_") != std::string::npos) return Cat::Civilian;
+        if (n.find("Bystander") != std::string::npos) return Cat::Civilian;
+        return Cat::Other;
+    }
+    namespace dead_track {
+        struct Entry { ue4::UObject* actor = nullptr; int32_t last_hp = 0; uint8_t state = 0; DWORD last_seen = 0; };
+        inline Entry g_entries[512] = {};
+        inline int   g_next = 0;
+        inline DWORD g_frame = 0;
+        inline void begin_frame() { g_frame++; }
+        inline Entry* find(ue4::UObject* a) { for (int i = 0; i < 512; ++i) if (g_entries[i].actor == a) return &g_entries[i]; return nullptr; }
+        inline Entry* alloc(ue4::UObject* a) {
+            Entry* e = &g_entries[g_next];
+            g_next = (g_next + 1) % 512;
+            e->actor = a; e->last_hp = 0; e->state = 0; e->last_seen = g_frame;
+            return e;
+        }
+        inline void clear_all() { for (int i = 0; i < 512; ++i) g_entries[i] = Entry{}; g_next = 0; }
+    }
+    inline bool      g_dead_filter_enabled = true;
+    inline uintptr_t g_dead_health_off = 0x6B0;
+    inline bool name_is_aux(const std::string& n) {
+        if (n.find("SenseActor") != std::string::npos) return true;
+        if (n.find("SensingActor") != std::string::npos) return true;
+        if (n.find("_GEN_VARIABLE_") != std::string::npos) return true;
+        return false;
+    }
+    inline bool is_dead(ue4::UObject* actor) {
+        using namespace dead_track;
+        if (!sane_ptr(actor)) return false;
+        Entry* e = find(actor);
+        if (!e) {
+            e = alloc(actor);
+            int32_t hp = safe_read_i32(actor, g_dead_health_off);
+            if (hp < 0 || hp >= 100'000) e->state = 2;
+            else if (hp == 0) e->state = 0;
+            else { e->state = 1; e->last_hp = hp; }
+            return false;
+        }
+        e->last_seen = g_frame;
+        int32_t hp = safe_read_i32(actor, g_dead_health_off);
+        if (e->state == 3) {
+            if (hp > 0 && hp < 100'000) { e->state = 1; e->last_hp = hp; return false; }
+            return true;
+        }
+        if (e->state == 2) return false;
+        if (hp < 0 || hp >= 100'000) { e->state = 2; return false; }
+        if (hp > 0) { e->state = 1; e->last_hp = hp; return false; }
+        if (e->state == 1 && e->last_hp > 0) { e->state = 3; return true; }
+        e->last_hp = 0;
+        return false;
+    }
+    inline Cat target_category(ue4::UObject* actor, ue4::UObject* me_pawn) {
+        if (!actor || actor == me_pawn) return Cat::Skip;
+        if (!sane_ptr(actor)) return Cat::Skip;
+        if (!is_pawn_class(actor)) return Cat::Skip;
+        const std::string& name = ue4::cached_name_of(actor);
+        if (name.empty()) return Cat::Skip;
+        if (name.find("Rat") != std::string::npos) return Cat::Skip;
+        if (name.find("PlayerCharacter") != std::string::npos) return Cat::Skip;
+        if (name_is_aux(name)) return Cat::Skip;
+        uintptr_t root = safe_read_uintptr(actor, off::AActor_RootComponent);
+        if (!sane_ptr(reinterpret_cast<void*>(root))) return Cat::Skip;
+        if (g_dead_filter_enabled && is_dead(actor)) return Cat::Skip;
+        return classify(name);
+    }
+    inline ue4::UObject* g_cam_cache = nullptr;
+    inline ue4::UObject* camera_manager() {
+        auto* pc = chain::local_pc();
+        if (pc) {
+            uintptr_t c = safe_read_uintptr(pc, off::APlayerController_PlayerCameraManager);
+            if (sane_ptr(reinterpret_cast<void*>(c))) { g_cam_cache = reinterpret_cast<ue4::UObject*>(c); return g_cam_cache; }
+        }
+        if (g_cam_cache && !chain::object_alive(g_cam_cache)) g_cam_cache = nullptr;
+        return g_cam_cache;
+    }
+    inline bool read_camera_raw(Vec3& loc, Rot& rot, float& fov) {
+        auto* cam = camera_manager();
+        if (!cam) return false;
+        float raw[12]{};
+        if (!smemcpy(raw, reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(cam) + off::APlayerCameraManager_CameraCachePrivate), sizeof(raw))) return false;
+        loc.x = raw[4]; loc.y = raw[5]; loc.z = raw[6];
+        rot.pitch = raw[7]; rot.yaw = raw[8]; rot.roll = raw[9];
+        fov = raw[10];
+        if (!std::isfinite(loc.x) || !std::isfinite(loc.y) || !std::isfinite(loc.z)) return false;
+        if (!std::isfinite(rot.pitch) || !std::isfinite(rot.yaw)) return false;
+        if (!std::isfinite(fov) || fov < 1.f || fov > 179.f) return false;
+        if (fabsf(loc.x) > 1e7f || fabsf(loc.y) > 1e7f || fabsf(loc.z) > 1e7f) return false;
+        if (fabsf(loc.x) < 1.f && fabsf(loc.y) < 1.f && fabsf(loc.z) < 1.f) return false;
+        return true;
+    }
+    struct CamFrame { Vec3 loc{}; Rot rot{}; float fov = 0.f; bool valid = false; DWORD frame = 0xFFFFFFFF; };
+    inline CamFrame g_cam_frame{};
+    inline DWORD   g_esp_frame = 0;
+    inline void begin_frame() { g_esp_frame++; dead_track::begin_frame(); }
+    inline bool read_camera(Vec3& loc, Rot& rot, float& fov) {
+        if (g_cam_frame.frame != g_esp_frame) {
+            g_cam_frame.valid = read_camera_raw(g_cam_frame.loc, g_cam_frame.rot, g_cam_frame.fov);
+            g_cam_frame.frame = g_esp_frame;
+        }
+        if (!g_cam_frame.valid) return false;
+        loc = g_cam_frame.loc; rot = g_cam_frame.rot; fov = g_cam_frame.fov;
+        return true;
+    }
+    inline bool object_location(ue4::UObject* obj, Vec3& out) {
+        out = Vec3{};
+        if (!sane_ptr(obj)) return false;
+        uintptr_t root = safe_read_uintptr(obj, off::AActor_RootComponent);
+        if (!sane_ptr(reinterpret_cast<void*>(root))) return false;
+        const uintptr_t candidates[] = { off::USceneComponent_RelativeLocation, 0x128, 0x130, 0x120, 0x118, 0x140 };
+        for (uintptr_t o : candidates) {
+            Vec3 t{};
+            if (!smemcpy(&t, reinterpret_cast<void*>(root + o), sizeof(t))) continue;
+            if (!std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z)) continue;
+            if (fabsf(t.x) > 1e7f || fabsf(t.y) > 1e7f || fabsf(t.z) > 1e7f) continue;
+            if (t.x == 0.f && t.y == 0.f && t.z == 0.f) continue;
+            out = t; return true;
+        }
+        return false;
+    }
+    inline bool on_screen(const Vec3& s, float mx = 0.f, float my = 0.f) {
+        if (s.z < 1.f) return false;
+        if (s.x < -mx || s.x > g_screen_w + mx) return false;
+        if (s.y < -my || s.y > g_screen_h + my) return false;
+        return true;
+    }
+    inline bool world_to_screen(const Vec3& world, Vec3& screen, int sw, int sh,
+        const Vec3& cam_loc, const Rot& cam_rot, float fov_deg) {
+        const float d2r = 3.14159265f / 180.f;
+        float cp = cosf(cam_rot.pitch * d2r), sp = sinf(cam_rot.pitch * d2r);
+        float cy = cosf(cam_rot.yaw * d2r), sy = sinf(cam_rot.yaw * d2r);
+        float fx = cp * cy, fy = cp * sy, fz = sp;
+        float rx = -sy, ry = cy, rz = 0.f;
+        float ux = -sp * cy, uy = -sp * sy, uz = cp;
+        float dx = world.x - cam_loc.x, dy = world.y - cam_loc.y, dz = world.z - cam_loc.z;
+        float x_cam = dx * rx + dy * ry + dz * rz;
+        float y_cam = dx * ux + dy * uy + dz * uz;
+        float z_cam = dx * fx + dy * fy + dz * fz;
+        if (z_cam < 1.f) return false;
+        float tan_half = tanf(fov_deg * d2r * 0.5f);
+        float aspect = float(sw) / float(sh);
+        float x_ndc = x_cam / (z_cam * tan_half);
+        float y_ndc = y_cam * aspect / (z_cam * tan_half);
+        screen.x = (sw * 0.5f) * (1.f + x_ndc);
+        screen.y = (sh * 0.5f) * (1.f - y_ndc);
+        screen.z = z_cam;
+        return true;
+    }
+} // namespace esp
+
+// ============================================================
+// ITEMS
+// ============================================================
+namespace items {
+    enum class ItemCat : int {
+        Skip = 0, Keycard, Money, Valuable, Objective, Ammo, Weapon, Tool,
+        Camera, Vault, Utility, SecurityRoom
+    };
+    struct Classified { ItemCat cat = ItemCat::Skip; const char* label = nullptr; ImU32 color = 0; };
+    inline bool g_on = true;
+    inline float g_max_dist = 150.f;
+    inline bool g_show_keycard = true;
+    inline bool g_show_money = true;
+    inline bool g_show_valuable = true;
+    inline bool g_show_objective = true;
+    inline bool g_show_ammo = false;
+    inline bool g_show_weapon = false;
+    inline bool g_show_tool = false;
+    inline bool g_show_camera = true;
+    inline bool g_show_vault = true;
+    inline bool g_show_utility = true;
+    inline bool g_show_security_room = true;
+    inline bool g_draw_line = false;
+    inline bool g_show_names = true;
+    inline bool lower_has(const std::string& l, const char* n) { return l.find(n) != std::string::npos; }
+    inline std::string pretty_name(const std::string& raw) {
+        if (raw.empty()) return {};
+        std::string s = raw;
+        static const char* kPrefixes[] = {
+            "SM_Prop_", "SM_Item_", "SM_Tool_", "SM_Chr_", "SM_Bld_", "SM_Env_", "SM_Wep_", "SM_",
+            "SK_Wep_", "SK_Chr_", "SK_", "BP_", "ChildActor1_", "ChildActor_"
+        };
+        for (const char* p : kPrefixes) {
+            size_t pl = strlen(p);
+            if (s.size() > pl && s.compare(0, pl, p) == 0) { s = s.substr(pl); break; }
+        }
+        while (true) {
+            size_t us = s.rfind('_');
+            if (us == std::string::npos || us + 1 >= s.size()) break;
+            bool all_digits = true;
+            for (size_t i = us + 1; i < s.size(); ++i)
+                if (s[i] < '0' || s[i] > '9') { all_digits = false; break; }
+            if (!all_digits) break;
+            s.resize(us);
+        }
+        for (auto& c : s) if (c == '_') c = ' ';
+        std::string mid; mid.reserve(s.size() + 8);
+        for (size_t i = 0; i < s.size(); ++i) {
+            char c = s[i];
+            if (i > 0 && c >= 'A' && c <= 'Z') {
+                char prev = s[i - 1];
+                bool pl = (prev >= 'a' && prev <= 'z');
+                bool pu = (prev >= 'A' && prev <= 'Z');
+                bool nl = (i + 1 < s.size() && s[i + 1] >= 'a' && s[i + 1] <= 'z');
+                if (pl || (pu && nl)) mid.push_back(' ');
+            }
+            mid.push_back(c);
+        }
+        std::string out; out.reserve(mid.size());
+        bool last_space = true;
+        for (char c : mid) {
+            if (c == ' ') { if (!last_space) { out.push_back(' '); last_space = true; } }
+            else { out.push_back(c); last_space = false; }
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        for (auto& c : out) if (c >= 'a' && c <= 'z') c -= 32;
+        return out.empty() ? raw : out;
+    }
+    inline Classified classify(const std::string& name) {
+        Classified c{};
+        if (name.empty()) return c;
+        std::string l = name;
+        for (auto& ch : l) if (ch >= 'A' && ch <= 'Z') ch += 32;
+        if (lower_has(l, "camera") || lower_has(l, "cctv") || lower_has(l, "cam_bp") ||
+            lower_has(l, "surveillance") || lower_has(l, "securitycam")) {
+            c.cat = ItemCat::Camera; c.label = "CAM"; c.color = IM_COL32(255, 0, 200, 255); return c;
+        }
+        if (lower_has(l, "vault")) { c.cat = ItemCat::Vault; c.label = "VAULT"; c.color = IM_COL32(255, 100, 0, 255); return c; }
+        if (lower_has(l, "utilityroom") || lower_has(l, "utility_room") || lower_has(l, "utilroom") ||
+            lower_has(l, "util_room") || (lower_has(l, "utility") && !lower_has(l, "utilityweapon"))) {
+            c.cat = ItemCat::Utility; c.label = "UTIL"; c.color = IM_COL32(140, 200, 255, 255); return c;
+        }
+        if (lower_has(l, "securityroom") || lower_has(l, "security_room") || lower_has(l, "secroom") ||
+            lower_has(l, "sec_room") || lower_has(l, "securityoffice") || lower_has(l, "security_office")) {
+            c.cat = ItemCat::SecurityRoom; c.label = "SECRM"; c.color = IM_COL32(255, 60, 60, 255); return c;
+        }
+        if (lower_has(l, "keycard") || lower_has(l, "key_card") || lower_has(l, "accesscard") ||
+            lower_has(l, "access_card") || lower_has(l, "cardkey") || lower_has(l, "card_key") ||
+            (lower_has(l, "key") && lower_has(l, "card"))) {
+            c.cat = ItemCat::Keycard; c.label = "KEYCARD"; c.color = IM_COL32(255, 70, 70, 255); return c;
+        }
+        if (lower_has(l, "lootbag") || lower_has(l, "loot_bag") || lower_has(l, "objective") || lower_has(l, "drill") ||
+            lower_has(l, "thermal") || lower_has(l, "c4") || lower_has(l, "satchel") || lower_has(l, "explosive") ||
+            lower_has(l, "bomb") || lower_has(l, "gadget")) {
+            c.cat = ItemCat::Objective; c.label = "OBJ"; c.color = IM_COL32(255, 140, 0, 255); return c;
+        }
+        if (lower_has(l, "gold") || lower_has(l, "jewel") || lower_has(l, "diamond") || lower_has(l, "gem") ||
+            lower_has(l, "valuable") || lower_has(l, "treasure") || lower_has(l, "artifact") || lower_has(l, "painting") ||
+            lower_has(l, "rolex") || lower_has(l, "bullion") || lower_has(l, "ingot") || lower_has(l, "necklace") ||
+            lower_has(l, "bracelet") || lower_has(l, "pearl")) {
+            c.cat = ItemCat::Valuable; c.label = "VALUABLE"; c.color = IM_COL32(255, 215, 0, 255); return c;
+        }
+        if (lower_has(l, "money") || lower_has(l, "cash") || lower_has(l, "dollar") || lower_has(l, "banknote") ||
+            lower_has(l, "wallet") || lower_has(l, "cashstack")) {
+            c.cat = ItemCat::Money; c.label = "MONEY"; c.color = IM_COL32(80, 255, 80, 255); return c;
+        }
+        if (lower_has(l, "ammo") || lower_has(l, "ammobox") || lower_has(l, "magazine") ||
+            lower_has(l, "clip") || lower_has(l, "shells")) {
+            c.cat = ItemCat::Ammo; c.label = "AMMO"; c.color = IM_COL32(200, 200, 200, 255); return c;
+        }
+        if (lower_has(l, "weaponpickup") || lower_has(l, "weapon_pickup") ||
+            (lower_has(l, "pickup") && (lower_has(l, "weapon") || lower_has(l, "gun") || lower_has(l, "rifle") ||
+                lower_has(l, "pistol") || lower_has(l, "smg") || lower_has(l, "shotgun")))) {
+            c.cat = ItemCat::Weapon; c.label = "WEAPON"; c.color = IM_COL32(120, 200, 255, 255); return c;
+        }
+        if (lower_has(l, "lockpick") || lower_has(l, "lock_pick") || lower_has(l, "crowbar") ||
+            lower_has(l, "screwdriver") || lower_has(l, "tool_") || lower_has(l, "toolbox")) {
+            c.cat = ItemCat::Tool; c.label = "TOOL"; c.color = IM_COL32(180, 180, 255, 255); return c;
+        }
+        return c;
+    }
+    inline bool cat_enabled(ItemCat c) {
+        switch (c) {
+        case ItemCat::Keycard: return g_show_keycard;
+        case ItemCat::Money: return g_show_money;
+        case ItemCat::Valuable: return g_show_valuable;
+        case ItemCat::Objective: return g_show_objective;
+        case ItemCat::Ammo: return g_show_ammo;
+        case ItemCat::Weapon: return g_show_weapon;
+        case ItemCat::Tool: return g_show_tool;
+        case ItemCat::Camera: return g_show_camera;
+        case ItemCat::Vault: return g_show_vault;
+        case ItemCat::Utility: return g_show_utility;
+        case ItemCat::SecurityRoom: return g_show_security_room;
+        default: return false;
+        }
+    }
+    inline void draw() {
+        if (!g_on) return;
+        if (!chain::world()) return;
+        esp::Vec3 cam_loc{}; esp::Rot cam_rot{}; float cam_fov = 0.f;
+        if (!esp::read_camera(cam_loc, cam_rot, cam_fov)) return;
+        auto* arr = actors::get_actors();
+        if (!arr) return;
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(arr);
+        int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+        if (n <= 0 || n > 100000) return;
+        uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+        if (!sane_ptr(reinterpret_cast<void*>(data))) return;
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const float cx = g_screen_w * 0.5f;
+        const float cy = g_screen_h * 0.5f;
+        for (int i = 0; i < n; ++i) {
+            uintptr_t actor_ptr = safe_read_uintptr(reinterpret_cast<void*>(data), i * 8);
+            if (!sane_ptr(reinterpret_cast<void*>(actor_ptr))) continue;
+            auto* actor = reinterpret_cast<ue4::UObject*>(actor_ptr);
+            const std::string& name = ue4::cached_name_of(actor);
+            if (name.empty()) continue;
+            Classified c = classify(name);
+            if (c.cat == ItemCat::Skip) continue;
+            if (!cat_enabled(c.cat)) continue;
+            if (esp::is_pawn_class(actor)) {
+                if (c.cat != ItemCat::Camera && c.cat != ItemCat::Vault &&
+                    c.cat != ItemCat::Utility && c.cat != ItemCat::SecurityRoom) continue;
+            }
+            esp::Vec3 wp{};
+            if (!esp::object_location(actor, wp)) continue;
+            float dx = wp.x - cam_loc.x, dy = wp.y - cam_loc.y, dz = wp.z - cam_loc.z;
+            float dist_m = sqrtf(dx * dx + dy * dy + dz * dz) / 100.f;
+            if (dist_m > g_max_dist) continue;
+            esp::Vec3 scr{};
+            if (!esp::world_to_screen(wp, scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov)) continue;
+            if (!esp::on_screen(scr, 200.f, 200.f)) continue;
+            dl->AddCircle({ scr.x, scr.y }, 7.f, c.color, 16, 1.5f);
+            dl->AddCircleFilled({ scr.x, scr.y }, 2.5f, c.color, 6);
+            char lbl[128];
+            snprintf(lbl, sizeof(lbl), "%s  %.0fm", c.label, dist_m);
+            ImVec2 sz = ImGui::CalcTextSize(lbl);
+            ImVec2 tp = { scr.x - sz.x * 0.5f, scr.y + 10.f };
+            dl->AddText({ tp.x + 1.f, tp.y + 1.f }, IM_COL32(0, 0, 0, 220), lbl);
+            dl->AddText(tp, c.color, lbl);
+            if (g_show_names) {
+                std::string display = pretty_name(name);
+                if (!display.empty()) {
+                    ImVec2 nsz = ImGui::CalcTextSize(display.c_str());
+                    ImVec2 np = { scr.x - nsz.x * 0.5f, tp.y + sz.y + 1.f };
+                    dl->AddText({ np.x + 1.f, np.y + 1.f }, IM_COL32(0, 0, 0, 220), display.c_str());
+                    dl->AddText(np, IM_COL32(230, 230, 230, 240), display.c_str());
+                }
+            }
+            if (g_draw_line) dl->AddLine({ cx, cy }, { scr.x, scr.y }, (c.color & 0x00FFFFFF) | 0x66000000, 1.0f);
+        }
+    }
+    inline void dump_all() {
+        const std::string path = paths::dump_path("item_dump.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== item dump ===");
+        auto* arr = actors::get_actors();
+        if (!arr) { dbg_to(path, "no actor array"); return; }
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(arr);
+        int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+        uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+        if (!sane_ptr(reinterpret_cast<void*>(data))) return;
+        int shown = 0;
+        for (int i = 0; i < n && shown < 4000; ++i) {
+            uintptr_t ap = safe_read_uintptr(reinterpret_cast<void*>(data), i * 8);
+            if (!sane_ptr(reinterpret_cast<void*>(ap))) continue;
+            auto* actor = reinterpret_cast<ue4::UObject*>(ap);
+            const std::string& name = ue4::cached_name_of(actor);
+            if (name.empty()) continue;
+            Classified c = classify(name);
+            std::string cname = ue4::class_name_of(actor);
+            dbg_to(path, "  [%-8s] %-50s class=%s", c.label ? c.label : "-", name.c_str(), cname.c_str());
+            shown++;
+        }
+        dbg_to(path, "=== end ===");
+        dbg("item dump -> %s", path.c_str());
+    }
+} // namespace items
+
+namespace aim {
+    struct Rot { float pitch, yaw, roll; };
+    inline Rot get_control_rotation() {
+        auto* pc = chain::local_pc(); Rot r{};
+        if (!pc) return r;
+        if (!smemcpy(&r, reinterpret_cast<uint8_t*>(pc) + off::APlayerController_ControlRotation, sizeof(r))) return Rot{};
+        if (!std::isfinite(r.pitch) || !std::isfinite(r.yaw)) return Rot{};
+        return r;
+    }
+    inline bool set_control_rotation(const Rot& r) {
+        auto* pc = chain::local_pc();
+        if (!pc) return false;
+        return smemcpy(reinterpret_cast<uint8_t*>(pc) + off::APlayerController_ControlRotation, &r, sizeof(r));
+    }
+    inline Rot look_at(const esp::Vec3& from, const esp::Vec3& to) {
+        Rot r{};
+        float dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;
+        float d2d = sqrtf(dx * dx + dy * dy);
+        r.pitch = atan2f(dz, d2d) * 180.f / 3.14159265f;
+        r.yaw = atan2f(dy, dx) * 180.f / 3.14159265f;
+        r.roll = 0.f;
+        return r;
+    }
+    inline float norm_deg(float a) { while (a > 180.f) a -= 360.f; while (a < -180.f) a += 360.f; return a; }
+    inline Rot lerp(const Rot& a, const Rot& b, float t) {
+        Rot r{};
+        r.pitch = a.pitch + norm_deg(b.pitch - a.pitch) * t;
+        r.yaw = a.yaw + norm_deg(b.yaw - a.yaw) * t;
+        return r;
+    }
+} // namespace aim
+
+// ============================================================
+// WEAPON
+// ============================================================
+namespace weapon {
+    inline ue4::UObject* local_weapon() {
+        auto* pawn = chain::local_pawn();
+        if (!pawn) return nullptr;
+        uintptr_t w = safe_read_uintptr(pawn, off::APlayerCharacter_HoldingGun);
+        if (!sane_ptr(reinterpret_cast<void*>(w))) return nullptr;
+        return reinterpret_cast<ue4::UObject*>(w);
+    }
+    inline float g_val_recoil = 0.0f;
+    inline float g_val_kick = 0.0f;
+    inline float g_val_accuracy = 100.0f;
+    inline float g_val_cooldown = 0.005f;
+    inline void dump_weapon() {
+        const std::string path = paths::dump_path("weapon_dump.txt");
+        auto* w = local_weapon();
+        if (!w) { dbg_to_begin(path); dbg_to(path, "not found"); return; }
+        dbg_to_begin(path);
+        dbg_to(path, "weapon ptr: %p", w);
+        dbg_to(path, "class: %s", ue4::class_name_of(w).c_str());
+        dbg_to(path, "RecoilStrength    = %.4f", safe_read_f32(w, off::GunBase_RecoilStrength));
+        dbg_to(path, "GunKickMultiplier = %.4f", safe_read_f32(w, off::GunBase_GunKickMultiplier));
+        dbg_to(path, "Accuracy          = %.4f", safe_read_f32(w, off::GunBase_Accuracy));
+        dbg_to(path, "AddedSpread       = %.4f", safe_read_f32(w, off::GunBase_AddedSpread));
+        dbg_to(path, "CoolDownTime      = %.4f", safe_read_f32(w, off::GunBase_CoolDownTime));
+        dbg_to(path, "BulletsLeft       = %d", safe_read_i32(w, off::GunBase_BulletsLeft));
+        dbg_to(path, "MagSize           = %d", safe_read_i32(w, off::GunBase_MagSize));
+        dbg_to(path, "CanShoot_         = %d", (int)safe_read_u8(w, off::GunBase_CanShoot));
+        dbg("weapon dump -> %s", path.c_str());
+    }
+} // namespace weapon
+
+// ============================================================
+// CHAMS
+// ============================================================
+namespace chams {
+    enum class Mode : int { Off = 0, Fill = 1, DepthFill = 2, DepthOnly = 3 };
+    inline int      g_mode = (int)Mode::Fill;
+    inline ImU32    g_color_visible = IM_COL32(0, 255, 120, 70);
+    inline ImU32    g_color_hidden = IM_COL32(255, 60, 60, 70);
+    inline bool     g_only_visible = false;
+    inline int      g_stencil = 250;
+    inline ue4::UObject* g_set_depth_fn = nullptr;
+    inline int           g_set_depth_state = 0;
+    inline ue4::UObject* g_set_stencil_fn = nullptr;
+    inline int           g_set_stencil_state = 0;
+    inline bool          g_mesh_off_resolved = false;
+    inline uintptr_t     g_mesh_off = 0x290;
+    struct SetBoolParams { bool v; uint8_t pad[7]; };
+    struct SetIntParams { int32_t v; uint8_t pad[4]; };
+    inline uintptr_t find_mesh_off(ue4::UObject* actor) {
+        if (!sane_ptr(actor)) return 0;
+        static const uintptr_t kCands[] = { 0x290, 0x2A0, 0x298, 0x288, 0x280, 0x2A8, 0x2B0, 0x2B8, 0x2C0 };
+        for (uintptr_t o : kCands) {
+            uintptr_t cand = safe_read_uintptr(actor, o);
+            if (!sane_ptr(reinterpret_cast<void*>(cand))) continue;
+            std::string cn = ue4::class_name_of(reinterpret_cast<ue4::UObject*>(cand));
+            if (cn.find("SkeletalMesh") != std::string::npos ||
+                cn.find("StaticMesh") != std::string::npos ||
+                cn.find("MeshComponent") != std::string::npos) return o;
+        }
+        return 0;
+    }
+    inline void resolve() {
+        if (g_set_depth_state != 0 && g_set_stencil_state != 0 && g_mesh_off_resolved) return;
+        auto* pawn = chain::local_pawn();
+        if (!pawn) return;
+        if (!g_mesh_off_resolved) {
+            uintptr_t off = find_mesh_off(pawn);
+            if (off) { g_mesh_off = off; g_mesh_off_resolved = true; off::ACharacter_Mesh = off; }
+        }
+        uintptr_t mesh = safe_read_uintptr(pawn, g_mesh_off);
+        if (!sane_ptr(reinterpret_cast<void*>(mesh))) return;
+        if (g_set_depth_state == 0) {
+            g_set_depth_fn = chain::resolve_on_chain(reinterpret_cast<ue4::UObject*>(mesh), "SetRenderCustomDepth");
+            if (!g_set_depth_fn) g_set_depth_fn = chain::resolve_on_chain(reinterpret_cast<ue4::UObject*>(mesh), "SetRenderCustomDepthEnabled");
+            g_set_depth_state = g_set_depth_fn ? 2 : 1;
+        }
+        if (g_set_stencil_state == 0) {
+            g_set_stencil_fn = chain::resolve_on_chain(reinterpret_cast<ue4::UObject*>(mesh), "SetCustomDepthStencilValue");
+            g_set_stencil_state = g_set_stencil_fn ? 2 : 1;
+        }
+    }
+    inline void apply_to(ue4::UObject* actor, bool visible) {
+        if (!g_set_depth_fn || !ue4::g_process_event) return;
+        uintptr_t mesh = safe_read_uintptr(actor, g_mesh_off);
+        if (!sane_ptr(reinterpret_cast<void*>(mesh))) return;
+        SetBoolParams p{}; p.v = true;
+        __try { ue4::g_process_event(reinterpret_cast<ue4::UObject*>(mesh), g_set_depth_fn, &p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (g_set_stencil_fn) {
+            SetIntParams sp{}; sp.v = visible ? g_stencil : (g_stencil + 1);
+            __try { ue4::g_process_event(reinterpret_cast<ue4::UObject*>(mesh), g_set_stencil_fn, &sp); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+} // namespace chams
+
+// ============================================================
+// SKINS
+// ============================================================
+namespace skins {
+    inline uintptr_t g_pawn_mesh = 0;
+    inline uintptr_t g_weapon_mesh = 0;
+    inline ue4::UObject* g_set_material_fn = nullptr;
+    inline int g_set_mat_state = 0;
+
+    struct Asset { ue4::UObject* obj = nullptr; std::string name; std::string cls; };
+    inline Asset g_mat_assets[2048] = {};
+    inline int g_mat_count = 0;
+    inline bool g_scanned = false;
+    inline int g_mat_sel = -1;
+    inline char g_mat_filter[64] = "";
+
+    inline ue4::UObject* g_persistent_weapon_mat = nullptr;
+    inline uintptr_t     g_last_weapon_mesh_ptr = 0;
+    inline uintptr_t     g_last_pawn_mesh_ptr = 0;
+    inline ue4::UObject* g_persistent_pawn_mat = nullptr;
+
+    struct SetMaterialParams { int32_t element_index; uint8_t _pad[4]; ue4::UObject* material; };
+
+    struct WeaponInfo {
+        ue4::UObject* weapon_class = nullptr;
+        std::string raw_name;
+        std::string display_name;
+    };
+    inline WeaponInfo g_weapons[128] = {};
+    inline int g_weapon_count = 0;
+    inline int g_weapon_sel = -1;
+    inline bool g_weapons_scanned = false;
+
+    struct WNameMap { const char* pattern; const char* display; };
+    inline const WNameMap kWeaponNames[] = {
+        { "Pistol_11A1",  "M1911" },
+        { "Rifle_B46D",   "B46D" },
+        { "Rifle_BPR28",  "BPR-28" },
+        { "Rifle_CX9",    "CX-9" },
+        { "Pistol_GT17",  "GT17" },
+        { "IM1_C",        "IM1-G" },
+        { "Rifle_L245",   "L245" },
+        { "Rifle_MK47",   "MK-47" },
+        { "MS950_C",      "M5 950" },
+        { "Rifle_N1A",    "N1A" },
+        { "SawedOff_C",   "Sawed off" },
+        { "Rifle_SP5",    "SP5" },
+        { "Rifle_SPR12",  "SPR-12" },
+        { "Rifle_TACRH",  "TAGR-H" },
+        { "Pistol_UP92",  "UP92" },
+        { "Pistol_UP99",  "UP99" },
+        { "XN-1070_C",    "XM-1078" },
+        { "Pistol_ZM48",  "ZM 48" },
+        { "Rifle_LC4",    "LC4" },
+        { "Pistol_KXUSP", "KXUSP" },
+    };
+    inline constexpr int kWeaponNameCount = sizeof(kWeaponNames) / sizeof(kWeaponNames[0]);
+
+    inline std::string pretty_weapon_name(const std::string& raw) {
+        for (int i = 0; i < kWeaponNameCount; ++i)
+            if (raw.find(kWeaponNames[i].pattern) != std::string::npos)
+                return kWeaponNames[i].display;
+        return {};
+    }
+
+    inline void scan_weapons() {
+        g_weapon_count = 0;
+        ue4::for_each_object([](ue4::UObject* o) -> bool {
+            if (g_weapon_count >= 128) return false;
+            if (!ue4::is_class_object(o)) return true;
+            const std::string& nm = ue4::cached_name_of(o);
+            if (nm.size() < 3 || nm.substr(nm.size() - 2) != "_C") return true;
+            if (nm.find("_GEN_VARIABLE_") != std::string::npos) return true;
+            if (nm.find("Attachment") != std::string::npos) return true;
+            if (nm.find("GunBase") != std::string::npos) return true;
+            if (nm.find("Item") != std::string::npos) return true;
+            if (nm.find("AttachedBackGun") != std::string::npos) return true;
+            std::string pretty = pretty_weapon_name(nm);
+            if (pretty.empty()) return true;
+            for (int j = 0; j < g_weapon_count; ++j)
+                if (g_weapons[j].display_name == pretty) return true;
+            g_weapons[g_weapon_count].weapon_class = o;
+            g_weapons[g_weapon_count].raw_name = nm;
+            g_weapons[g_weapon_count].display_name = pretty;
+            g_weapon_count++;
+            return true;
+            });
+        g_weapons_scanned = true;
+        dbg("skins: scanned %d weapon classes", g_weapon_count);
+    }
+
+    inline void scan_assets() {
+        g_mat_count = 0;
+        ue4::for_each_object([](ue4::UObject* o) -> bool {
+            std::string cls = ue4::class_name_of(o);
+            if (cls.empty()) return true;
+            if (cls == "Material" || cls == "MaterialInstance" ||
+                cls == "MaterialInstanceConstant" || cls == "MaterialInstanceDynamic") {
+                if (g_mat_count < 2048) {
+                    g_mat_assets[g_mat_count].obj = o;
+                    g_mat_assets[g_mat_count].name = ue4::cached_name_of(o);
+                    g_mat_assets[g_mat_count].cls = cls;
+                    g_mat_count++;
+                }
+            }
+            return true;
+            });
+        g_scanned = true;
+        dbg("skins: scanned %d materials", g_mat_count);
+    }
+
+    inline uintptr_t find_mesh_comp(ue4::UObject* actor) {
+        if (!sane_ptr(actor)) return 0;
+        static const uintptr_t kCands[] = { 0x290, 0x2A0, 0x298, 0x288, 0x280, 0x2A8, 0x2B0, 0x2B8, 0x2C0, 0x2C8 };
+        for (uintptr_t o : kCands) {
+            uintptr_t cand = safe_read_uintptr(actor, o);
+            if (!sane_ptr(reinterpret_cast<void*>(cand))) continue;
+            std::string cn = ue4::class_name_of(reinterpret_cast<ue4::UObject*>(cand));
+            if (cn.find("SkeletalMesh") != std::string::npos ||
+                cn.find("StaticMesh") != std::string::npos) return cand;
+        }
+        return 0;
+    }
+
+    inline void resolve() {
+        auto* pawn = chain::local_pawn();
+        if (pawn) { uintptr_t m = find_mesh_comp(pawn); if (m) g_pawn_mesh = m; }
+        auto* w = weapon::local_weapon();
+        if (w) { uintptr_t wm = find_mesh_comp(w); if (wm) g_weapon_mesh = wm; }
+        uintptr_t any = g_weapon_mesh ? g_weapon_mesh : g_pawn_mesh;
+        if (!any) return;
+        if (g_set_mat_state == 0) {
+            g_set_material_fn = chain::resolve_on_chain(reinterpret_cast<ue4::UObject*>(any), "SetMaterial");
+            g_set_mat_state = g_set_material_fn ? 2 : 1;
+        }
+    }
+
+    inline void apply_material(uintptr_t mesh, ue4::UObject* mat, int slot = 0) {
+        if (!mesh || !mat || !g_set_material_fn || !ue4::g_process_event) return;
+        SetMaterialParams p{};
+        p.element_index = slot;
+        p.material = mat;
+        __try { ue4::g_process_event(reinterpret_cast<ue4::UObject*>(mesh), g_set_material_fn, &p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+
+    inline void apply_weapon_material() {
+        if (!g_scanned) scan_assets();
+        if (g_mat_sel < 0 || g_mat_sel >= g_mat_count) return;
+        if (!g_weapon_mesh) resolve();
+        if (!g_weapon_mesh) { dbg("skins: no weapon mesh"); return; }
+        g_persistent_weapon_mat = g_mat_assets[g_mat_sel].obj;
+        apply_material(g_weapon_mesh, g_persistent_weapon_mat, 0);
+        dbg("skins: weapon mat -> %s", g_mat_assets[g_mat_sel].name.c_str());
+    }
+    inline void apply_pawn_material() {
+        if (!g_scanned) scan_assets();
+        if (g_mat_sel < 0 || g_mat_sel >= g_mat_count) return;
+        if (!g_pawn_mesh) resolve();
+        if (!g_pawn_mesh) return;
+        g_persistent_pawn_mat = g_mat_assets[g_mat_sel].obj;
+        apply_material(g_pawn_mesh, g_persistent_pawn_mat, 0);
+    }
+
+    inline ue4::UObject* find_weapon_instance(ue4::UObject* weapon_class) {
+        if (!sane_ptr(weapon_class)) return nullptr;
+        ue4::UObject* found = nullptr;
+        uintptr_t target = reinterpret_cast<uintptr_t>(weapon_class);
+        ue4::for_each_object([&](ue4::UObject* o) -> bool {
+            if (o == weapon_class) return true;
+            uintptr_t cls = safe_read_uintptr(o, off::UObject_Class);
+            if (cls != target) return true;
+            found = o;
+            return false;
+            });
+        return found;
+    }
+
+    inline void apply_material_to_selected_weapon() {
+        if (g_weapon_sel < 0 || g_weapon_sel >= g_weapon_count) return;
+        if (g_mat_sel < 0 || g_mat_sel >= g_mat_count) return;
+        auto* wc = g_weapons[g_weapon_sel].weapon_class;
+        auto* inst = find_weapon_instance(wc);
+        if (!inst) { dbg("skins: no instance of %s", g_weapons[g_weapon_sel].display_name.c_str()); return; }
+        uintptr_t mesh = find_mesh_comp(inst);
+        if (!mesh) { dbg("skins: no mesh on weapon"); return; }
+        apply_material(mesh, g_mat_assets[g_mat_sel].obj, 0);
+        dbg("skins: %s -> %s", g_mat_assets[g_mat_sel].name.c_str(),
+            g_weapons[g_weapon_sel].display_name.c_str());
+    }
+
+    inline void tick_reapply() {
+        if (!ue4::g_process_event) return;
+        auto* w = weapon::local_weapon();
+        uintptr_t wm = w ? find_mesh_comp(w) : 0;
+        if (wm) {
+            g_weapon_mesh = wm;
+            if (wm != g_last_weapon_mesh_ptr) {
+                g_last_weapon_mesh_ptr = wm;
+                if (g_persistent_weapon_mat && g_set_material_fn)
+                    apply_material(wm, g_persistent_weapon_mat, 0);
+            }
+        }
+        auto* pawn = chain::local_pawn();
+        uintptr_t pm = pawn ? find_mesh_comp(pawn) : 0;
+        if (pm) {
+            g_pawn_mesh = pm;
+            if (pm != g_last_pawn_mesh_ptr) {
+                g_last_pawn_mesh_ptr = pm;
+                if (g_persistent_pawn_mat && g_set_material_fn)
+                    apply_material(pm, g_persistent_pawn_mat, 0);
+            }
+        }
+    }
+
+    inline void clear_persistent() {
+        g_persistent_weapon_mat = nullptr;
+        g_persistent_pawn_mat = nullptr;
+        g_last_weapon_mesh_ptr = 0;
+        g_last_pawn_mesh_ptr = 0;
+    }
+
+    inline void dump() {
+        const std::string path = paths::dump_path("skin_dump.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== skin asset dump ===");
+        dbg_to(path, "pawn_mesh=%p  weapon_mesh=%p", (void*)g_pawn_mesh, (void*)g_weapon_mesh);
+        dbg_to(path, "SetMaterial=%s",
+            g_set_mat_state == 2 ? "ok" : (g_set_mat_state == 1 ? "missing" : "..."));
+        if (!g_scanned) scan_assets();
+        if (!g_weapons_scanned) scan_weapons();
+        dbg_to(path, "\n-- %d Material assets --", g_mat_count);
+        for (int i = 0; i < g_mat_count && i < 800; ++i) dbg_to(path, "  [%d] %s", i, g_mat_assets[i].name.c_str());
+        dbg_to(path, "\n-- %d weapon classes --", g_weapon_count);
+        for (int i = 0; i < g_weapon_count; ++i)
+            dbg_to(path, "  [%d] %-12s raw: %s",
+                i, g_weapons[i].display_name.c_str(), g_weapons[i].raw_name.c_str());
+        dbg_to(path, "=== end ===");
+        dbg("skin dump -> %s", path.c_str());
+    }
+} // namespace skins
+
+// ============================================================
+// SKYBOX
+// ============================================================
+namespace skybox {
+    inline ue4::UObject* g_sky_actor = nullptr;
+    inline uintptr_t     g_sky_mesh = 0;
+    inline ue4::UObject* g_current = nullptr;
+    inline int           g_mat_sel = -1;
+    inline char          g_mat_filter[64] = "Sky";
+    inline int           g_mat_slot = 0;
+    inline int           g_scan_state = 0;
+    struct SetMatParams { int32_t element_index; uint8_t _pad[4]; ue4::UObject* material; };
+    inline bool name_looks_like_sky(const std::string& n) {
+        if (n.find("Sky") != std::string::npos) return true;
+        if (n.find("Atmosphere") != std::string::npos) return true;
+        if (n.find("Cloud") != std::string::npos) return true;
+        if (n.find("Sunset") != std::string::npos) return true;
+        if (n.find("Dawn") != std::string::npos) return true;
+        if (n.find("Dusk") != std::string::npos) return true;
+        return false;
+    }
+    inline ue4::UObject* find_sky_actor() {
+        if (g_sky_actor && chain::object_alive(g_sky_actor)) return g_sky_actor;
+        g_sky_actor = nullptr;
+        auto* arr = actors::get_actors();
+        if (arr) {
+            uintptr_t arr_addr = reinterpret_cast<uintptr_t>(arr);
+            int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+            uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+            if (sane_ptr(reinterpret_cast<void*>(data)) && n > 0 && n < 100000) {
+                for (int i = 0; i < n; ++i) {
+                    uintptr_t ap = safe_read_uintptr(reinterpret_cast<void*>(data), i * 8);
+                    if (!sane_ptr(reinterpret_cast<void*>(ap))) continue;
+                    auto* actor = reinterpret_cast<ue4::UObject*>(ap);
+                    const std::string& cn = ue4::class_name_of(actor);
+                    if (cn.find("Character") != std::string::npos) continue;
+                    if (cn.find("Pawn") != std::string::npos) continue;
+                    if (name_looks_like_sky(cn)) {
+                        g_sky_actor = actor;
+                        dbg("skybox: actor = %s @ %p", cn.c_str(), actor);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!g_sky_actor) {
+            ue4::for_each_object([](ue4::UObject* o) -> bool {
+                const std::string& cn = ue4::class_name_of(o);
+                if (cn.empty()) return true;
+                if (cn.find("SkySphere") == std::string::npos &&
+                    cn.find("SkyDome") == std::string::npos &&
+                    cn.find("BP_Sky") == std::string::npos) return true;
+                if (cn.size() > 2 && cn.substr(cn.size() - 2) == "_C") return true;
+                g_sky_actor = o;
+                dbg("skybox: GObjects hit = %s @ %p", cn.c_str(), o);
+                return false;
+                });
+        }
+        return g_sky_actor;
+    }
+    inline uintptr_t find_sky_mesh(ue4::UObject* actor) {
+        if (!sane_ptr(actor)) return 0;
+        static const uintptr_t kCands[] = {
+            0x130, 0x2A0, 0x290, 0x288, 0x280, 0x298, 0x2A8, 0x2B0, 0x2B8, 0x2C0, 0x2C8, 0x138, 0x140
+        };
+        for (uintptr_t o : kCands) {
+            uintptr_t cand = safe_read_uintptr(actor, o);
+            if (!sane_ptr(reinterpret_cast<void*>(cand))) continue;
+            std::string cn = ue4::class_name_of(reinterpret_cast<ue4::UObject*>(cand));
+            if (cn.find("StaticMesh") != std::string::npos ||
+                cn.find("SkeletalMesh") != std::string::npos ||
+                cn.find("MeshComponent") != std::string::npos) return cand;
+        }
+        return 0;
+    }
+    inline void resolve() {
+        if (g_scan_state == 2) return;
+        auto* actor = find_sky_actor();
+        if (!actor) { g_scan_state = 1; return; }
+        g_sky_mesh = find_sky_mesh(actor);
+        if (!g_sky_mesh) { g_scan_state = 1; dbg("skybox: no mesh on sky actor"); return; }
+        if (!skins::g_set_material_fn) {
+            skins::g_set_material_fn = chain::resolve_on_chain(reinterpret_cast<ue4::UObject*>(g_sky_mesh), "SetMaterial");
+            if (skins::g_set_material_fn) skins::g_set_mat_state = 2;
+        }
+        g_scan_state = 2;
+        dbg("skybox: ready (mesh=%p)", (void*)g_sky_mesh);
+    }
+    inline void apply(ue4::UObject* mat) {
+        if (!mat) return;
+        if (g_scan_state != 2) resolve();
+        if (!g_sky_mesh || !skins::g_set_material_fn || !ue4::g_process_event) return;
+        SetMatParams p{};
+        p.element_index = g_mat_slot;
+        p.material = mat;
+        __try { ue4::g_process_event(reinterpret_cast<ue4::UObject*>(g_sky_mesh), skins::g_set_material_fn, &p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        g_current = mat;
+        dbg("skybox: applied slot %d", g_mat_slot);
+    }
+    inline void reset() {
+        if (g_sky_mesh && skins::g_set_material_fn && ue4::g_process_event) {
+            SetMatParams p{};
+            p.element_index = g_mat_slot;
+            p.material = nullptr;
+            __try { ue4::g_process_event(reinterpret_cast<ue4::UObject*>(g_sky_mesh), skins::g_set_material_fn, &p); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        g_current = nullptr;
+    }
+    inline uintptr_t g_last_mesh = 0;
+    inline void tick_reapply() {
+        if (!g_current) return;
+        if (!g_sky_mesh) resolve();
+        if (!g_sky_mesh) return;
+        if (g_sky_mesh != g_last_mesh) {
+            g_last_mesh = g_sky_mesh;
+            apply(g_current);
+        }
+    }
+} // namespace skybox
+
+// ============================================================
+// SPEEDHACK / NOCLIP / INF JUMPS / HEALTH / AMMO / RECOIL / RAPID
+// ============================================================
+namespace speedhack {
+    using QPC_t = BOOL(WINAPI*)(LARGE_INTEGER*);
+    inline QPC_t o_qpc = nullptr;
+    inline float          g_speed = 1.0f;
+    inline bool           g_on = false;
+    inline LARGE_INTEGER  g_last_real = {};
+    inline LARGE_INTEGER  g_fake = {};
+    inline LARGE_INTEGER  g_qpc_freq = {};
+    inline CRITICAL_SECTION g_cs;
+    inline bool           g_cs_init = false;
+    inline bool           g_installed = false;
+    BOOL WINAPI hk_qpc(LARGE_INTEGER* out) {
+        if (!o_qpc) return FALSE;
+        LARGE_INTEGER real;
+        if (!o_qpc(&real)) return FALSE;
+        if (!g_cs_init) { *out = real; return TRUE; }
+        EnterCriticalSection(&g_cs);
+        LONGLONG real_delta = real.QuadPart - g_last_real.QuadPart;
+        g_last_real = real;
+        float sp = g_on ? g_speed : 1.0f;
+        if (sp < 0.f) sp = 0.f;
+        LONGLONG scaled = (LONGLONG)((double)real_delta * (double)sp);
+        g_fake.QuadPart += scaled;
+        LARGE_INTEGER result = g_fake;
+        LeaveCriticalSection(&g_cs);
+        *out = result;
+        return TRUE;
+    }
+    inline void install() {
+        if (g_installed) return;
+        if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = true; }
+        QueryPerformanceFrequency(&g_qpc_freq);
+        QueryPerformanceCounter(&g_last_real);
+        g_fake = g_last_real;
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        if (!k32) return;
+        void* addr = (void*)GetProcAddress(k32, "QueryPerformanceCounter");
+        if (!addr) return;
+        MH_STATUS st = MH_CreateHook(addr, &hk_qpc, reinterpret_cast<LPVOID*>(&o_qpc));
+        if (st != MH_OK) return;
+        st = MH_EnableHook(addr);
+        if (st != MH_OK) return;
+        g_installed = true;
+    }
+} // namespace speedhack
+
+namespace noclip {
+    static constexpr uintptr_t UCharMove_MovementMode = 0x0168;
+    static constexpr uintptr_t UCharMove_CustomMovementMode = 0x0169;
+    static constexpr uintptr_t UCharMove_MaxFlySpeed = 0x0198;
+    static constexpr uintptr_t UCharMove_bCheatFlying_Byte = 0x0388;
+    static constexpr uint8_t   UCharMove_bCheatFlying_Bit = 0x08;
+    static constexpr uint8_t   MOVE_Flying = 5;
+    inline ue4::UObject* fn_set_actor_collision = nullptr;
+    inline int           find_state = 0;
+    struct EnableCollisionParms { bool bNewEnableCollision; uint8_t _pad[7]; };
+    inline void find_functions(ue4::UObject* pawn) {
+        if (find_state != 0) return;
+        find_state = 1;
+        uintptr_t cls = safe_read_uintptr(pawn, off::UObject_Class);
+        int d = 0;
+        while (cls && d++ < 32) {
+            auto* f = chain::find_function_on_class(reinterpret_cast<ue4::UObject*>(cls), "SetActorEnableCollision");
+            if (f) { fn_set_actor_collision = f; break; }
+            cls = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_SuperStruct);
+        }
+    }
+    inline void call_set_collision(ue4::UObject* actor, bool enabled) {
+        if (!fn_set_actor_collision || !ue4::g_process_event) return;
+        EnableCollisionParms p{};
+        p.bNewEnableCollision = enabled;
+        __try { ue4::g_process_event(actor, fn_set_actor_collision, &p); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    inline bool    g_have_orig = false;
+    inline uint8_t g_orig_movement_mode = 0;
+    inline uint8_t g_orig_custom_mode = 0;
+    inline uint8_t g_orig_cheat_byte = 0;
+    inline float   g_orig_fly_speed = 0.f;
+    inline bool    g_collision_disabled = false;
+    inline float   g_fly_speed = 3000.f;
+    inline void tick(bool on) {
+        auto* pawn = chain::local_pawn();
+        if (!pawn) { g_have_orig = false; g_collision_disabled = false; return; }
+        uintptr_t mc = safe_read_uintptr(pawn, off::ACharacter_CharacterMovement);
+        if (!sane_ptr(reinterpret_cast<void*>(mc))) return;
+        if (!on) {
+            if (g_have_orig) {
+                safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_MovementMode, g_orig_movement_mode);
+                safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_CustomMovementMode, g_orig_custom_mode);
+                safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_bCheatFlying_Byte, g_orig_cheat_byte);
+                safe_write_f32(reinterpret_cast<void*>(mc), UCharMove_MaxFlySpeed, g_orig_fly_speed);
+                g_have_orig = false;
+            }
+            if (g_collision_disabled) { call_set_collision(pawn, true); g_collision_disabled = false; }
+            return;
+        }
+        if (find_state == 0) find_functions(pawn);
+        if (!g_have_orig) {
+            g_orig_movement_mode = safe_read_u8(reinterpret_cast<void*>(mc), UCharMove_MovementMode);
+            g_orig_custom_mode = safe_read_u8(reinterpret_cast<void*>(mc), UCharMove_CustomMovementMode);
+            g_orig_cheat_byte = safe_read_u8(reinterpret_cast<void*>(mc), UCharMove_bCheatFlying_Byte);
+            g_orig_fly_speed = safe_read_f32(reinterpret_cast<void*>(mc), UCharMove_MaxFlySpeed);
+            g_have_orig = true;
+        }
+        safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_MovementMode, MOVE_Flying);
+        safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_CustomMovementMode, 0);
+        safe_write_f32(reinterpret_cast<void*>(mc), UCharMove_MaxFlySpeed, g_fly_speed);
+        uint8_t cb = safe_read_u8(reinterpret_cast<void*>(mc), UCharMove_bCheatFlying_Byte);
+        safe_write_u8(reinterpret_cast<void*>(mc), UCharMove_bCheatFlying_Byte, (uint8_t)(cb | UCharMove_bCheatFlying_Bit));
+        if (!g_collision_disabled) { call_set_collision(pawn, false); g_collision_disabled = true; }
+    }
+} // namespace noclip
+
+namespace infinite_jump {
+    static constexpr uintptr_t ACharacter_JumpCurrentCount = 0x0348;
+    static constexpr uintptr_t ACharacter_JumpMaxCount = 0x0344;
+    inline void tick(bool on) {
+        if (!on) return;
+        auto* pawn = chain::local_pawn();
+        if (!pawn) return;
+        safe_write_i32(pawn, ACharacter_JumpCurrentCount, 0);
+        safe_write_i32(pawn, ACharacter_JumpMaxCount, 999);
+    }
+} // namespace infinite_jump
+
+namespace inf_health {
+    inline int32_t g_value = 99999;
+    inline void tick(bool on) {
+        if (!on) return;
+        auto* pawn = chain::local_pawn();
+        if (!pawn) return;
+        safe_write_i32(pawn, off::APlayerCharacter_Health, g_value);
+        safe_write_i32(pawn, off::APlayerCharacter_MaxHealth, g_value);
+    }
+} // namespace inf_health
+
+namespace inf_ammo {
+    inline int32_t g_value = 999;
+    inline void fill_array(ue4::UObject* pawn, uintptr_t off, int32_t val) {
+        uintptr_t arr = reinterpret_cast<uintptr_t>(pawn) + off;
+        int32_t num = safe_read_i32(reinterpret_cast<void*>(arr), 8);
+        uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr), 0);
+        if (!sane_ptr(reinterpret_cast<void*>(data))) return;
+        if (num <= 0 || num > 16) return;
+        for (int32_t i = 0; i < num; ++i)
+            safe_write_i32(reinterpret_cast<void*>(data), (uintptr_t)i * 4, val);
+    }
+    inline void tick(bool on) {
+        if (!on) return;
+        auto* pawn = chain::local_pawn();
+        if (!pawn) return;
+        fill_array(pawn, off::APlayerCharacter_GunAmmos, g_value);
+        fill_array(pawn, off::APlayerCharacter_ReserveAmmo, g_value);
+        auto* w = weapon::local_weapon();
+        if (!w) return;
+        int32_t mag = safe_read_i32(w, off::GunBase_MagSize);
+        if (mag > 0 && mag < 9999) safe_write_i32(w, off::GunBase_BulletsLeft, g_value);
+    }
+} // namespace inf_ammo
+
+namespace recoil {
+    inline bool     g_on = false;
+    inline bool     g_skip_call = false;
+    inline int32_t  g_cmp_idx = 0;
+    inline bool     g_resolved = false;
+    inline void resolve() {
+        if (g_resolved) return;
+        g_resolved = true;
+        ue4::for_each_object([](ue4::UObject* o) -> bool {
+            ue4::FName fn{};
+            if (!smemcpy(&fn, reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(o) + off::UObject_Name), sizeof(fn))) return true;
+            if (fn.comparison_index <= 0) return true;
+            const std::string& name = ue4::name_to_string_cached(fn);
+            if (name == "AlphaRecoil__UpdateFunc" || name == "Recoil__UpdateFunc") g_cmp_idx = fn.comparison_index;
+            return true;
+            });
+    }
+    inline bool intercept(ue4::UObject* fn, void* params) {
+        if (!g_on || !fn || !g_cmp_idx) return false;
+        ue4::FName fn_name{};
+        if (!smemcpy(&fn_name, reinterpret_cast<uint8_t*>(fn) + 0x18, sizeof(fn_name))) return false;
+        if (fn_name.comparison_index != g_cmp_idx) return false;
+        if (params) { float zero = 0.f; smemcpy(params, &zero, sizeof(zero)); }
+        return g_skip_call;
+    }
+} // namespace recoil
+
+namespace rapid {
+    inline bool          g_on = false;
+    inline float         g_rate = 15.f;
+    inline DWORD         g_last_ms = 0;
+    inline ue4::UObject* g_shoot_fn = nullptr;
+    inline int           g_scan_done = 0;
+    inline void scan() {
+        if (g_scan_done == 2) return;
+        g_scan_done = 1;
+        auto* w = weapon::local_weapon();
+        if (!w) { g_scan_done = 0; return; }
+        g_shoot_fn = chain::find_function_on_class(w, "ShootClient");
+        if (!g_shoot_fn) g_shoot_fn = chain::find_function_on_class(w, "ShootAnimMulti");
+        g_scan_done = g_shoot_fn ? 2 : 0;
+    }
+    inline void tick() {
+        auto* w = weapon::local_weapon();
+        if (!w) return;
+        if (g_scan_done != 2) { scan(); return; }
+        if (!g_shoot_fn) return;
+        safe_write_u8(w, off::GunBase_CanShoot, 1);
+        if (!g_on) return;
+        if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) return;
+        DWORD now = GetTickCount();
+        DWORD interval = (DWORD)(1000.0f / (g_rate < 0.5f ? 0.5f : g_rate));
+        if (now - g_last_ms < interval) return;
+        g_last_ms = now;
+        uint8_t params[64] = {};
+        __try { ue4::g_process_event(w, g_shoot_fn, params); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+} // namespace rapid
+
+// ============================================================
+// PROGRESSION
+// ============================================================
+namespace progression {
+    inline int32_t g_cash_value = 1'000'000;
+    inline float   g_xp_value = 50'000.f;
+    inline int32_t g_level_value = 50;
+
+    inline ue4::UObject* g_addxp_fn = nullptr;       inline int g_addxp_state = 0;
+    inline ue4::UObject* g_save_cash_fn = nullptr;   inline int g_save_cash_state = 0;
+    inline ue4::UObject* g_save_level_fn = nullptr;  inline int g_save_level_state = 0;
+    inline ue4::UObject* g_savegame = nullptr;
+    inline bool g_sustain_cash = false;
+    inline bool g_sustain_xp = false;
+
+    struct AddEXPParams { float Amount; bool LevelUp; uint8_t _pad[3]; };
+
+    inline void resolve_functions() {
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        if (g_addxp_state == 0) {
+            g_addxp_fn = chain::resolve_on_chain(pc, "AddEXP");
+            g_addxp_state = g_addxp_fn ? 2 : 1;
+        }
+        if (g_save_cash_state == 0) { g_save_cash_fn = chain::resolve_on_chain(pc, "SaveCash"); g_save_cash_state = g_save_cash_fn ? 2 : 1; }
+        if (g_save_level_state == 0) { g_save_level_fn = chain::resolve_on_chain(pc, "SaveLevel"); g_save_level_state = g_save_level_fn ? 2 : 1; }
+    }
+    inline ue4::UObject* find_savegame() {
+        if (g_savegame && chain::object_alive(g_savegame)) {
+            if (ue4::class_name_of(g_savegame) == "OAR_Savegame_C") return g_savegame;
+            g_savegame = nullptr;
+        }
+        ue4::for_each_object([](ue4::UObject* o) -> bool {
+            if (ue4::class_name_of(o) == "OAR_Savegame_C") { g_savegame = o; return false; }
+            return true;
+            });
+        return g_savegame;
+    }
+    inline void grant_cash(bool persist) {
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        safe_write_i32(pc, off::RobberController_Cash, g_cash_value);
+        if (auto* sg = find_savegame()) safe_write_i32(sg, off::Savegame_CashSave, g_cash_value);
+        if (persist && g_save_cash_fn && ue4::g_process_event) {
+            __try { ue4::g_process_event(pc, g_save_cash_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    inline void grant_level(bool persist) {
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        safe_write_i32(pc, off::RobberController_Level, g_level_value);
+        if (auto* sg = find_savegame()) safe_write_i32(sg, off::Savegame_LevelSave, g_level_value);
+        if (persist && g_save_level_fn && ue4::g_process_event) {
+            __try { ue4::g_process_event(pc, g_save_level_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    inline void grant_xp(bool persist) {
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        if (g_addxp_state == 2 && g_addxp_fn) {
+            AddEXPParams p{};
+            p.Amount = g_xp_value; p.LevelUp = false;
+            __try { ue4::g_process_event(pc, g_addxp_fn, &p); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        }
+        else {
+            safe_write_f32(pc, off::RobberController_Exp, g_xp_value);
+            if (auto* sg = find_savegame()) safe_write_f32(sg, off::Savegame_EXPSave, g_xp_value);
+        }
+        if (persist && g_save_level_fn && ue4::g_process_event) {
+            __try { ue4::g_process_event(pc, g_save_level_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    inline void tick_sustain() {
+        if (g_sustain_cash) grant_cash(false);
+        if (g_sustain_xp)   grant_xp(false);
+    }
+    inline void dump() {
+        const std::string path = paths::dump_path("progression_dump.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== progression dump ===");
+        auto* pc = chain::local_pc();
+        if (pc) {
+            dbg_to(path, "pc class=%s", ue4::class_name_of(pc).c_str());
+            dbg_to(path, "  Cash  = %d", safe_read_i32(pc, off::RobberController_Cash));
+            dbg_to(path, "  Level = %d", safe_read_i32(pc, off::RobberController_Level));
+            dbg_to(path, "  Exp   = %.2f", safe_read_f32(pc, off::RobberController_Exp));
+        }
+        if (auto* sg = find_savegame()) {
+            dbg_to(path, "savegame = %p", sg);
+            dbg_to(path, "  CashSave  = %d", safe_read_i32(sg, off::Savegame_CashSave));
+            dbg_to(path, "  LevelSave = %d", safe_read_i32(sg, off::Savegame_LevelSave));
+            dbg_to(path, "  EXPSave   = %.2f", safe_read_f32(sg, off::Savegame_EXPSave));
+        }
+        dbg("progression dump -> %s", path.c_str());
+    }
+} // namespace progression
+
+// ============================================================
+// SAVE — maps via ShopItem_Map_* classes
+// ============================================================
+namespace sav_gen {
+    inline std::string g_folder;
+    inline std::string g_username;
+    inline std::vector<std::string> g_sav_files;
+    inline bool g_folder_scanned = false;
+    inline bool g_folder_created = false;
+    inline int  g_sav_verify_count = 0;
+
+    inline ue4::UObject* g_maps[64] = {};
+    inline int           g_map_count = 0;
+    inline bool          g_maps_scanned = false;
+
+    inline std::string get_username() {
+        if (!g_username.empty()) return g_username;
+        char buf[256];
+        DWORD n = GetEnvironmentVariableA("USERNAME", buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) g_username = buf;
+        else g_username = "(unknown)";
+        return g_username;
+    }
+
+    inline std::string resolve_oar_save_folder() {
+        char buf[MAX_PATH];
+        if (GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH) == 0) return {};
+        std::string base = buf;
+        std::string p1 = base + "\\OAR";
+        std::string p2 = p1 + "\\Saved";
+        std::string p3 = p2 + "\\SaveGames";
+        if (GetFileAttributesA(p1.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryA(p1.c_str(), nullptr)) return {};
+        }
+        if (GetFileAttributesA(p2.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryA(p2.c_str(), nullptr)) return {};
+        }
+        if (GetFileAttributesA(p3.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryA(p3.c_str(), nullptr)) return {};
+            g_folder_created = true;
+        }
+        return p3;
+    }
+
+    inline std::string find_save_folder() {
+        std::string oar = resolve_oar_save_folder();
+        if (!oar.empty()) return oar;
+        return {};
+    }
+
+    inline void scan_folder() {
+        g_sav_files.clear();
+        get_username();
+        g_folder = find_save_folder();
+        if (g_folder.empty()) { g_folder_scanned = true; return; }
+        std::string pat = g_folder + "\\*.sav";
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat.c_str(), &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { g_sav_files.push_back(g_folder + "\\" + fd.cFileName); } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        }
+        g_sav_verify_count = (int)g_sav_files.size();
+        g_folder_scanned = true;
+        dbg("sav_gen: user=%s folder=%s files=%d", g_username.c_str(), g_folder.c_str(), g_sav_verify_count);
+    }
+
+    // KEY: UnlockedMaps stores ShopItem_Map_*_C classes. Include them.
+    inline bool class_name_is_map(const std::string& n) {
+        if (n.size() < 3 || n.substr(n.size() - 2) != "_C") return false;
+        if (n.find("_GEN_VARIABLE_") != std::string::npos) return false;
+        // The shop-items that represent map ownership
+        if (n.find("ShopItem_Map_") == 0) {
+            if (n == "ShopItem_Map_base_C") return false;   // base class itself
+            return true;
+        }
+        return false;
+    }
+
+    inline int scan_maps() {
+        g_map_count = 0;
+        ue4::for_each_object([](ue4::UObject* o) -> bool {
+            if (g_map_count >= 64) return false;
+            if (!ue4::is_class_object(o)) return true;
+            const std::string& nm = ue4::cached_name_of(o);
+            if (!class_name_is_map(nm)) return true;
+            bool dup = false;
+            for (int j = 0; j < g_map_count; ++j) if (g_maps[j] == o) { dup = true; break; }
+            if (!dup) { g_maps[g_map_count++] = o; dbg("sav_gen: map -> %s", nm.c_str()); }
+            return true;
+            });
+        g_maps_scanned = true;
+        return g_map_count;
+    }
+
+    struct TArrRef { uintptr_t addr; uintptr_t data; int32_t num; int32_t max; };
+    inline TArrRef read_tarr(uintptr_t addr) {
+        TArrRef r{}; r.addr = addr;
+        r.data = safe_read_uintptr(reinterpret_cast<void*>(addr), 0);
+        r.num = safe_read_i32(reinterpret_cast<void*>(addr), 8);
+        r.max = safe_read_i32(reinterpret_cast<void*>(addr), 12);
+        return r;
+    }
+    inline bool write_tarr_meta(uintptr_t addr, uintptr_t data, int32_t num, int32_t max) {
+        if (!smemcpy(reinterpret_cast<uint8_t*>(addr), &data, 8)) return false;
+        if (!smemcpy(reinterpret_cast<uint8_t*>(addr) + 8, &num, 4)) return false;
+        if (!smemcpy(reinterpret_cast<uint8_t*>(addr) + 12, &max, 4)) return false;
+        return true;
+    }
+
+    // ownership check via the live UnlockedMaps
+    inline bool is_map_owned(ue4::UObject* pc, ue4::UObject* map_class) {
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(pc) + off::RobberController_UnlockedMaps;
+        TArrRef r = read_tarr(arr_addr);
+        if (!sane_ptr(reinterpret_cast<void*>(r.data)) || r.num <= 0 || r.num > 256) return false;
+        uintptr_t target = reinterpret_cast<uintptr_t>(map_class);
+        for (int32_t i = 0; i < r.num; ++i) {
+            uintptr_t e = safe_read_uintptr(reinterpret_cast<void*>(r.data), (uintptr_t)i * 8);
+            if (e == target) return true;
+        }
+        return false;
+    }
+
+    inline ue4::UObject* g_addmap_fn = nullptr;
+    inline int g_addmap_state = 0;
+    struct AddMapParams { ue4::UObject* Map; uint8_t _pad[8]; };
+    inline void resolve_addmap() {
+        if (g_addmap_state != 0) return;
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        g_addmap_fn = chain::resolve_on_chain(pc, "AddMap");
+        g_addmap_state = g_addmap_fn ? 2 : 1;
+    }
+
+    inline int inject_maps_via_addmap() {
+        auto* pc = chain::local_pc();
+        if (!pc) return 0;
+        if (!g_maps_scanned) scan_maps();
+        if (g_map_count == 0) return 0;
+        resolve_addmap();
+        if (!g_addmap_fn || !ue4::g_process_event) return 0;
+        int added = 0, skipped = 0;
+        for (int i = 0; i < g_map_count; ++i) {
+            if (is_map_owned(pc, g_maps[i])) { skipped++; continue; }
+            AddMapParams p{};
+            p.Map = g_maps[i];
+            __try {
+                ue4::g_process_event(pc, g_addmap_fn, &p);
+                added++;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        dbg("sav_gen: AddMap +%d (skipped %d owned)", added, skipped);
+        return added;
+    }
+
+    inline ue4::UObject* g_savemaps_fn = nullptr;
+    inline int g_savemaps_state = 0;
+    inline void resolve_savemaps() {
+        if (g_savemaps_state != 0) return;
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        g_savemaps_fn = chain::resolve_on_chain(pc, "SaveMaps");
+        g_savemaps_state = g_savemaps_fn ? 2 : 1;
+    }
+
+    inline void force_save_maps() {
+        auto* pc = chain::local_pc();
+        if (!pc) return;
+        resolve_savemaps();
+        if (g_savemaps_fn && ue4::g_process_event) {
+            __try { ue4::g_process_event(pc, g_savemaps_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (progression::g_save_cash_fn) {
+            __try { ue4::g_process_event(pc, progression::g_save_cash_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (progression::g_save_level_fn) {
+            __try { ue4::g_process_event(pc, progression::g_save_level_fn, nullptr); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+
+    inline int g_last_result = 0;
+    inline void unlock_and_save() {
+        auto* pc = chain::local_pc();
+        if (!pc) { g_last_result = -1; return; }
+        get_username();
+        g_folder = resolve_oar_save_folder();
+        scan_maps();
+        if (g_map_count == 0) { g_last_result = -2; return; }
+        int added = inject_maps_via_addmap();
+        force_save_maps();
+        Sleep(250);
+        scan_folder();
+        g_last_result = added;
+        dbg("sav_gen: added=%d savs=%d", added, g_sav_verify_count);
+    }
+
+    inline void open_save_folder() {
+        if (g_folder.empty()) scan_folder();
+        if (g_folder.empty()) return;
+        ShellExecuteA(nullptr, "open", g_folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    inline void dump_unlocked_contents() {
+        const std::string path = paths::dump_path("unlocked_contents.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== RobberController.UnlockedMaps contents ===");
+        auto* pc = chain::local_pc();
+        if (!pc) { dbg_to(path, "no pc"); dbg("unlocked dump -> %s", path.c_str()); return; }
+
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(pc) + off::RobberController_UnlockedMaps;
+        TArrRef r = read_tarr(arr_addr);
+        dbg_to(path, "data=%p  num=%d  max=%d", (void*)r.data, r.num, r.max);
+
+        if (!sane_ptr(reinterpret_cast<void*>(r.data)) || r.num <= 0 || r.num > 64) {
+            dbg_to(path, "array empty or bad");
+            dbg("unlocked dump -> %s", path.c_str());
+            return;
+        }
+        for (int32_t i = 0; i < r.num; ++i) {
+            uintptr_t entry = safe_read_uintptr(reinterpret_cast<void*>(r.data), (uintptr_t)i * 8);
+            if (!sane_ptr(reinterpret_cast<void*>(entry))) {
+                dbg_to(path, "  [%d] null", i);
+                continue;
+            }
+            auto* e = reinterpret_cast<ue4::UObject*>(entry);
+            const std::string& nm = ue4::cached_name_of(e);
+            std::string cn = ue4::class_name_of(e);
+            dbg_to(path, "  [%d] %p  name=%s  class=%s", i, (void*)e, nm.c_str(), cn.c_str());
+        }
+
+        if (auto* sg = progression::find_savegame()) {
+            uintptr_t sa = reinterpret_cast<uintptr_t>(sg) + off::Savegame_MapsSave;
+            TArrRef sr = read_tarr(sa);
+            dbg_to(path, "\nsg MapsSave: data=%p num=%d max=%d", (void*)sr.data, sr.num, sr.max);
+            if (sane_ptr(reinterpret_cast<void*>(sr.data)) && sr.num > 0 && sr.num < 64) {
+                for (int32_t i = 0; i < sr.num; ++i) {
+                    uintptr_t entry = safe_read_uintptr(reinterpret_cast<void*>(sr.data), (uintptr_t)i * 8);
+                    if (!sane_ptr(reinterpret_cast<void*>(entry))) continue;
+                    auto* e = reinterpret_cast<ue4::UObject*>(entry);
+                    dbg_to(path, "  sg[%d] %p  name=%s  class=%s",
+                        i, (void*)e,
+                        ue4::cached_name_of(e).c_str(),
+                        ue4::class_name_of(e).c_str());
+                }
+            }
+        }
+        dbg_to(path, "=== end ===");
+        dbg("unlocked dump -> %s", path.c_str());
+    }
+
+    inline void dump_shop_items() {
+        const std::string path = paths::dump_path("shop_items.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== ShopItem_Map_* CDO dump ===");
+        ue4::for_each_object([&](ue4::UObject* o) -> bool {
+            if (!ue4::is_class_object(o)) return true;
+            const std::string& nm = ue4::cached_name_of(o);
+            if (nm.find("ShopItem_Map_") != 0) return true;
+            if (nm.size() < 3 || nm.substr(nm.size() - 2) != "_C") return true;
+
+            dbg_to(path, "\n--- %s @ %p ---", nm.c_str(), (void*)o);
+
+            static const uintptr_t kCdoOffsets[] = { 0x118, 0x110, 0x108, 0x120, 0x0F8, 0x100 };
+            uintptr_t cdo = 0;
+            for (uintptr_t off : kCdoOffsets) {
+                uintptr_t c = safe_read_uintptr(o, off);
+                if (!sane_ptr(reinterpret_cast<void*>(c))) continue;
+                std::string cn = ue4::class_name_of(reinterpret_cast<ue4::UObject*>(c));
+                if (cn == "ShopItem_Map_base_C" || cn.find("ShopItem") != std::string::npos) {
+                    cdo = c;
+                    dbg_to(path, "  CDO @ off 0x%X = %p (class=%s)", (unsigned)off, (void*)c, cn.c_str());
+                    break;
+                }
+            }
+            if (!cdo) { dbg_to(path, "  CDO not found"); return true; }
+
+            dbg_to(path, "  pointer scan:");
+            for (uintptr_t off = 0x20; off < 0x400; off += 8) {
+                uintptr_t v = safe_read_uintptr(reinterpret_cast<void*>(cdo), off);
+                if (!sane_ptr(reinterpret_cast<void*>(v))) continue;
+                std::string cn = ue4::class_name_of(reinterpret_cast<ue4::UObject*>(v));
+                if (cn.empty()) continue;
+                const std::string& on = ue4::cached_name_of(reinterpret_cast<ue4::UObject*>(v));
+                dbg_to(path, "    [0x%X] %p  obj=%s  cls=%s",
+                    (unsigned)off, (void*)v, on.c_str(), cn.c_str());
+            }
+            return true;
+            });
+        dbg_to(path, "\n=== end ===");
+        dbg("shop items dump -> %s", path.c_str());
+    }
+
+    inline void dump() {
+        const std::string path = paths::dump_path("sav_dump.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== sav_gen dump ===");
+        get_username();
+        if (g_folder.empty()) scan_folder();
+        dbg_to(path, "username: %s", g_username.c_str());
+        dbg_to(path, "save folder: %s", g_folder.empty() ? "(not found)" : g_folder.c_str());
+        dbg_to(path, "sav count: %d", g_sav_verify_count);
+        for (const auto& f : g_sav_files) dbg_to(path, "  %s", f.c_str());
+        if (!g_maps_scanned) scan_maps();
+        dbg_to(path, "map candidates: %d", g_map_count);
+        for (int i = 0; i < g_map_count; ++i)
+            dbg_to(path, "  [%d] %s @ %p", i, ue4::cached_name_of(g_maps[i]).c_str(), (void*)g_maps[i]);
+        if (auto* pc = chain::local_pc()) {
+            uintptr_t ca = reinterpret_cast<uintptr_t>(pc) + off::RobberController_UnlockedMaps;
+            TArrRef r = read_tarr(ca);
+            dbg_to(path, "ctrl UnlockedMaps: data=%p num=%d max=%d", (void*)r.data, r.num, r.max);
+        }
+        if (auto* sg = progression::find_savegame()) {
+            uintptr_t sa = reinterpret_cast<uintptr_t>(sg) + off::Savegame_MapsSave;
+            TArrRef r = read_tarr(sa);
+            dbg_to(path, "sg MapsSave: data=%p num=%d max=%d", (void*)r.data, r.num, r.max);
+        }
+        dbg_to(path, "AddMap=%d  SaveMaps=%d", g_addmap_state, g_savemaps_state);
+        dbg_to(path, "=== end ===");
+        dbg("sav dump -> %s", path.c_str());
+    }
+} // namespace sav_gen
+
+// ============================================================
+// STEALTH
+// ============================================================
+namespace stealth {
+    inline bool g_on = false;
+    inline const char* g_patterns[] = {
+        "OnPlayerSeen", "OnSeePlayer", "OnPlayerDetected", "OnPlayerSpotted",
+        "ReportPlayer", "ReportSeen", "DetectPlayer", "SpotPlayer", "SensePlayer",
+        "CanSeePlayer", "CanSeePawn", "VisionCheck", "SightCheck",
+        "PlayerDetected", "AlertPlayer",
+    };
+    inline constexpr int g_pattern_count = sizeof(g_patterns) / sizeof(g_patterns[0]);
+    inline int32_t g_cmp_idxs[256] = {};
+    inline int g_cmp_count = 0;
+    inline bool g_resolved = false;
+    inline bool g_filter_onseen = true;
+    inline bool g_filter_report = true;
+    inline bool g_filter_detect = true;
+    inline bool g_filter_cansee = true;
+    inline bool g_filter_misc = true;
+    inline bool pattern_enabled(const char* p) {
+        std::string s = p;
+        if (s.find("OnPlayerSeen") != std::string::npos || s.find("OnSeePlayer") != std::string::npos ||
+            s.find("OnPlayerDetected") != std::string::npos || s.find("OnPlayerSpotted") != std::string::npos ||
+            s.find("PlayerDetected") != std::string::npos) return g_filter_onseen;
+        if (s.find("Report") != std::string::npos) return g_filter_report;
+        if (s.find("Detect") != std::string::npos || s.find("Spot") != std::string::npos) return g_filter_detect;
+        if (s.find("CanSee") != std::string::npos) return g_filter_cansee;
+        return g_filter_misc;
+    }
+    inline void resolve() {
+        if (g_resolved) return;
+        g_resolved = true;
+        int found = 0;
+        ue4::for_each_object([&](ue4::UObject* o) -> bool {
+            if (found >= 256) return false;
+            ue4::FName fn{};
+            if (!smemcpy(&fn, reinterpret_cast<uint8_t*>(o) + off::UObject_Name, sizeof(fn))) return true;
+            if (fn.comparison_index <= 0) return true;
+            const std::string& nm = ue4::name_to_string_cached(fn);
+            if (nm.empty()) return true;
+            for (int p = 0; p < g_pattern_count; ++p) {
+                if (nm.find(g_patterns[p]) != std::string::npos) {
+                    bool dup = false;
+                    for (int k = 0; k < found; ++k) if (g_cmp_idxs[k] == fn.comparison_index) { dup = true; break; }
+                    if (!dup) g_cmp_idxs[found++] = fn.comparison_index;
+                    break;
+                }
+            }
+            return true;
+            });
+        g_cmp_count = found;
+        dbg("stealth: resolved %d", found);
+    }
+    inline bool is_target(int32_t cmp_idx) {
+        if (!g_on || cmp_idx <= 0 || g_cmp_count <= 0) return false;
+        for (int i = 0; i < g_cmp_count; ++i) if (g_cmp_idxs[i] == cmp_idx) return true;
+        return false;
+    }
+    inline void dump_sensing_fns() {
+        const std::string path = paths::dump_path("stealth_dump.txt");
+        dbg_to_begin(path);
+        dbg_to(path, "=== stealth dump ===");
+        dbg_to(path, "resolved: %d", g_cmp_count);
+        for (int i = 0; i < g_cmp_count; ++i) dbg_to(path, "  cmp_idx=0x%X", g_cmp_idxs[i]);
+        dbg_to(path, "=== end ===");
+        dbg("stealth dump -> %s", path.c_str());
+    }
+} // namespace stealth
+
+namespace features {
+    static char g_log[32768] = "ready\n";
+    inline void logf(const char* fmt, ...) {
+        char buf[512];
+        va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+        strncat_s(g_log, buf, sizeof(g_log) - strlen(g_log) - 1);
+        strncat_s(g_log, "\n", sizeof(g_log) - strlen(g_log) - 1);
+    }
+
+    inline bool  g_esp_on = true;
+    inline bool  g_esp_box = true;
+    inline bool  g_esp_distance = true;
+    inline bool  g_esp_self = false;
+    inline bool  g_esp_visible = true;
+    inline bool  g_esp_camera = true;
+    inline bool  g_esp_hide_dead = true;
+    inline bool  g_esp_show_names = true;
+    inline float g_esp_max_dist = 300.f;
+    inline float g_esp_max_box_px = 1500.f;
+    inline float g_esp_head_off = 70.f;
+    inline float g_esp_feet_off = -60.f;
+    inline bool  g_cat_guard = true;
+    inline bool  g_cat_police = true;
+    inline bool  g_cat_civilian = false;
+    inline bool  g_cat_other = false;
+    inline bool  g_aim_on = false;
+    inline bool  g_aim_always = false;
+    inline bool  g_aim_snap = false;
+    inline bool  g_aim_show_fov_circle = true;
+    inline bool  g_aim_silent = false;
+    inline bool  g_aim_los = true;
+    inline bool  g_aim_instant_lock = true;
+    inline float g_aim_fov = 10.f;
+    inline float g_aim_smooth = 2.f;
+    inline float g_aim_height = 70.f;
+    inline int   g_aim_key = VK_XBUTTON2;
+    inline bool  g_aim_key_prev = false;
+    inline bool  g_aim_listen = false;
+    inline bool  g_tp_on = false;
+    inline float g_tp_distance = 220.f;
+    inline float g_tp_height = 30.f;
+    inline bool  g_no_recoil = false;
+    inline bool  g_no_spread = false;
+    inline bool  g_rapid_fire = false;
+    inline bool  g_speedhack_on = false;
+    inline float g_speedhack_val = 2.0f;
+    inline int   g_speed_key = 'B';
+    inline bool  g_speed_key_prev = false;
+    inline bool  g_speed_listen = false;
+    inline bool  g_noclip_on = false;
+    inline int   g_noclip_key = 'V';
+    inline bool  g_noclip_key_prev = false;
+    inline bool  g_noclip_listen = false;
+    inline bool  g_infjump_on = false;
+    inline int   g_infjump_key = 'F';
+    inline bool  g_infjump_key_prev = false;
+    inline bool  g_infjump_listen = false;
+    inline bool    g_infhealth_on = false;
+    inline int32_t g_infhealth_val = 99999;
+    inline bool    g_infammo_on = false;
+    inline int32_t g_infammo_val = 999;
+    inline bool  g_rapid_pe_on = false;
+    inline float g_rapid_pe_rate = 15.f;
+    inline bool  g_debug_pe = false;
+    inline std::string g_config_name = "default";
+    inline char        g_config_name_buf[64] = "default";
+    inline char        g_config_status[128] = "";
+    inline DWORD       g_config_flash_until = 0;
+    inline bool        g_config_flash = false;
+
+    inline bool cat_enabled(esp::Cat c) {
+        switch (c) {
+        case esp::Cat::Guard: return g_cat_guard;
+        case esp::Cat::Police: return g_cat_police;
+        case esp::Cat::Civilian: return g_cat_civilian;
+        case esp::Cat::Other: return g_cat_other;
+        default: return false;
+        }
+    }
+    inline bool key_listen_once(int& vk_out, bool& listen_flag) {
+        for (int vk = 1; vk < 256; ++vk) {
+            if (GetAsyncKeyState(vk) & 0x8000) {
+                if (vk != VK_ESCAPE) vk_out = vk;
+                listen_flag = false;
+                return true;
+            }
+        }
+        return false;
+    }
+    inline void tick_keybinds() {
+        bool down = (GetAsyncKeyState(g_aim_key) & 0x8000) != 0;
+        if (down && !g_aim_key_prev) g_aim_on = !g_aim_on;
+        g_aim_key_prev = down;
+        if (g_aim_listen) key_listen_once(g_aim_key, g_aim_listen);
+        bool sd = (GetAsyncKeyState(g_speed_key) & 0x8000) != 0;
+        if (sd && !g_speed_key_prev) g_speedhack_on = !g_speedhack_on;
+        g_speed_key_prev = sd;
+        if (g_speed_listen) key_listen_once(g_speed_key, g_speed_listen);
+        bool nd = (GetAsyncKeyState(g_noclip_key) & 0x8000) != 0;
+        if (nd && !g_noclip_key_prev) g_noclip_on = !g_noclip_on;
+        g_noclip_key_prev = nd;
+        if (g_noclip_listen) key_listen_once(g_noclip_key, g_noclip_listen);
+        bool jd = (GetAsyncKeyState(g_infjump_key) & 0x8000) != 0;
+        if (jd && !g_infjump_key_prev) g_infjump_on = !g_infjump_on;
+        g_infjump_key_prev = jd;
+        if (g_infjump_listen) key_listen_once(g_infjump_key, g_infjump_listen);
+    }
+    inline void tick_weapon() {
+        auto* w = weapon::local_weapon();
+        if (w) {
+            if (g_no_recoil) {
+                safe_write_f32(w, off::GunBase_RecoilStrength, weapon::g_val_recoil);
+                safe_write_f32(w, off::GunBase_GunKickMultiplier, weapon::g_val_kick);
+            }
+            if (g_no_spread) {
+                safe_write_f32(w, off::GunBase_AddedSpread, 0.f);
+                safe_write_f32(w, off::GunBase_Accuracy, weapon::g_val_accuracy);
+            }
+            if (g_rapid_fire) {
+                safe_write_f32(w, off::GunBase_CoolDownTime, weapon::g_val_cooldown);
+                safe_write_u8(w, off::GunBase_CanShoot, 1);
+            }
+        }
+        recoil::g_on = g_no_recoil;
+        recoil::g_skip_call = g_no_recoil;
+        if (!recoil::g_resolved) recoil::resolve();
+        if (g_no_recoil) {
+            auto* pawn = chain::local_pawn();
+            if (pawn) safe_write_f32(pawn, off::APlayerCharacter_AlphaRecoilAlpha, 0.f);
+        }
+        rapid::g_on = g_rapid_pe_on;
+        rapid::g_rate = g_rapid_pe_rate;
+        rapid::tick();
+    }
+    inline void tick_movement() {
+        speedhack::g_on = g_speedhack_on;
+        speedhack::g_speed = g_speedhack_val;
+        noclip::tick(g_noclip_on);
+        infinite_jump::tick(g_infjump_on);
+    }
+    inline void tick_combat() {
+        inf_health::g_value = g_infhealth_val;
+        inf_ammo::g_value = g_infammo_val;
+        inf_health::tick(g_infhealth_on);
+        inf_ammo::tick(g_infammo_on);
+    }
+
+    inline bool config_save() {
+        const std::string path = paths::config_path(g_config_name);
+        if (path.empty()) return false;
+        std::ostringstream o;
+        o << "# femboy hacks config\n# name: " << g_config_name << "\n\n";
+        o << "esp_on " << (g_esp_on ? 1 : 0) << "\n";
+        o << "esp_box " << (g_esp_box ? 1 : 0) << "\n";
+        o << "esp_distance " << (g_esp_distance ? 1 : 0) << "\n";
+        o << "esp_self " << (g_esp_self ? 1 : 0) << "\n";
+        o << "esp_visible " << (g_esp_visible ? 1 : 0) << "\n";
+        o << "esp_camera " << (g_esp_camera ? 1 : 0) << "\n";
+        o << "esp_hide_dead " << (g_esp_hide_dead ? 1 : 0) << "\n";
+        o << "esp_show_names " << (g_esp_show_names ? 1 : 0) << "\n";
+        o << "esp_max_dist " << g_esp_max_dist << "\n";
+        o << "esp_max_box_px " << g_esp_max_box_px << "\n";
+        o << "esp_head_off " << g_esp_head_off << "\n";
+        o << "esp_feet_off " << g_esp_feet_off << "\n";
+        o << "cat_guard " << (g_cat_guard ? 1 : 0) << "\n";
+        o << "cat_police " << (g_cat_police ? 1 : 0) << "\n";
+        o << "cat_civilian " << (g_cat_civilian ? 1 : 0) << "\n";
+        o << "cat_other " << (g_cat_other ? 1 : 0) << "\n";
+        o << "aim_on " << (g_aim_on ? 1 : 0) << "\n";
+        o << "aim_always " << (g_aim_always ? 1 : 0) << "\n";
+        o << "aim_snap " << (g_aim_snap ? 1 : 0) << "\n";
+        o << "aim_silent " << (g_aim_silent ? 1 : 0) << "\n";
+        o << "aim_los " << (g_aim_los ? 1 : 0) << "\n";
+        o << "aim_instant_lock " << (g_aim_instant_lock ? 1 : 0) << "\n";
+        o << "aim_show_fov_circle " << (g_aim_show_fov_circle ? 1 : 0) << "\n";
+        o << "aim_fov " << g_aim_fov << "\n";
+        o << "aim_smooth " << g_aim_smooth << "\n";
+        o << "aim_height " << g_aim_height << "\n";
+        o << "aim_key " << g_aim_key << "\n";
+        o << "tp_on " << (g_tp_on ? 1 : 0) << "\n";
+        o << "tp_distance " << g_tp_distance << "\n";
+        o << "tp_height " << g_tp_height << "\n";
+        o << "no_recoil " << (g_no_recoil ? 1 : 0) << "\n";
+        o << "no_spread " << (g_no_spread ? 1 : 0) << "\n";
+        o << "rapid_fire " << (g_rapid_fire ? 1 : 0) << "\n";
+        o << "wv_recoil " << weapon::g_val_recoil << "\n";
+        o << "wv_kick " << weapon::g_val_kick << "\n";
+        o << "wv_accuracy " << weapon::g_val_accuracy << "\n";
+        o << "wv_cooldown " << weapon::g_val_cooldown << "\n";
+        o << "rapid_pe " << (g_rapid_pe_on ? 1 : 0) << "\n";
+        o << "rapid_pe_rate " << g_rapid_pe_rate << "\n";
+        o << "speed_on " << (g_speedhack_on ? 1 : 0) << "\n";
+        o << "speed_val " << g_speedhack_val << "\n";
+        o << "speed_key " << g_speed_key << "\n";
+        o << "noclip " << (g_noclip_on ? 1 : 0) << "\n";
+        o << "noclip_key " << g_noclip_key << "\n";
+        o << "noclip_speed " << noclip::g_fly_speed << "\n";
+        o << "infjump " << (g_infjump_on ? 1 : 0) << "\n";
+        o << "infjump_key " << g_infjump_key << "\n";
+        o << "infhealth " << (g_infhealth_on ? 1 : 0) << "\n";
+        o << "infhealth_val " << g_infhealth_val << "\n";
+        o << "infammo " << (g_infammo_on ? 1 : 0) << "\n";
+        o << "infammo_val " << g_infammo_val << "\n";
+        o << "items_on " << (items::g_on ? 1 : 0) << "\n";
+        o << "items_max_dist " << items::g_max_dist << "\n";
+        o << "items_line " << (items::g_draw_line ? 1 : 0) << "\n";
+        o << "items_names " << (items::g_show_names ? 1 : 0) << "\n";
+        o << "items_keycard " << (items::g_show_keycard ? 1 : 0) << "\n";
+        o << "items_money " << (items::g_show_money ? 1 : 0) << "\n";
+        o << "items_valuable " << (items::g_show_valuable ? 1 : 0) << "\n";
+        o << "items_objective " << (items::g_show_objective ? 1 : 0) << "\n";
+        o << "items_ammo " << (items::g_show_ammo ? 1 : 0) << "\n";
+        o << "items_weapon " << (items::g_show_weapon ? 1 : 0) << "\n";
+        o << "items_tool " << (items::g_show_tool ? 1 : 0) << "\n";
+        o << "items_camera " << (items::g_show_camera ? 1 : 0) << "\n";
+        o << "items_vault " << (items::g_show_vault ? 1 : 0) << "\n";
+        o << "items_utility " << (items::g_show_utility ? 1 : 0) << "\n";
+        o << "items_secroom " << (items::g_show_security_room ? 1 : 0) << "\n";
+        o << "chams_mode " << chams::g_mode << "\n";
+        o << "chams_only_visible " << (chams::g_only_visible ? 1 : 0) << "\n";
+        o << "chams_stencil " << chams::g_stencil << "\n";
+        o << "prog_cash_val " << progression::g_cash_value << "\n";
+        o << "prog_xp_val " << progression::g_xp_value << "\n";
+        o << "prog_level_val " << progression::g_level_value << "\n";
+        o << "prog_sustain_cash " << (progression::g_sustain_cash ? 1 : 0) << "\n";
+        o << "prog_sustain_xp " << (progression::g_sustain_xp ? 1 : 0) << "\n";
+        o << "stealth_on " << (stealth::g_on ? 1 : 0) << "\n";
+        return paths::write_all(path, o.str());
+    }
+    inline bool config_load() {
+        const std::string path = paths::config_path(g_config_name);
+        std::string data;
+        if (!paths::read_all(path, data)) return false;
+        std::istringstream f(data);
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream iss(line);
+            std::string key; iss >> key;
+            if (key.empty()) continue;
+            auto geti = [&]() { int v = 0; iss >> v; return v; };
+            auto getf = [&]() { float v = 0.f; iss >> v; return v; };
+            if (key == "esp_on") g_esp_on = geti() != 0;
+            else if (key == "esp_box") g_esp_box = geti() != 0;
+            else if (key == "esp_distance") g_esp_distance = geti() != 0;
+            else if (key == "esp_self") g_esp_self = geti() != 0;
+            else if (key == "esp_visible") g_esp_visible = geti() != 0;
+            else if (key == "esp_camera") g_esp_camera = geti() != 0;
+            else if (key == "esp_hide_dead") g_esp_hide_dead = geti() != 0;
+            else if (key == "esp_show_names") g_esp_show_names = geti() != 0;
+            else if (key == "esp_max_dist") g_esp_max_dist = getf();
+            else if (key == "esp_max_box_px") g_esp_max_box_px = getf();
+            else if (key == "esp_head_off") g_esp_head_off = getf();
+            else if (key == "esp_feet_off") g_esp_feet_off = getf();
+            else if (key == "cat_guard") g_cat_guard = geti() != 0;
+            else if (key == "cat_police") g_cat_police = geti() != 0;
+            else if (key == "cat_civilian") g_cat_civilian = geti() != 0;
+            else if (key == "cat_other") g_cat_other = geti() != 0;
+            else if (key == "aim_on") g_aim_on = geti() != 0;
+            else if (key == "aim_always") g_aim_always = geti() != 0;
+            else if (key == "aim_snap") g_aim_snap = geti() != 0;
+            else if (key == "aim_silent") g_aim_silent = geti() != 0;
+            else if (key == "aim_los") g_aim_los = geti() != 0;
+            else if (key == "aim_instant_lock") g_aim_instant_lock = geti() != 0;
+            else if (key == "aim_show_fov_circle") g_aim_show_fov_circle = geti() != 0;
+            else if (key == "aim_fov") g_aim_fov = getf();
+            else if (key == "aim_smooth") g_aim_smooth = getf();
+            else if (key == "aim_height") g_aim_height = getf();
+            else if (key == "aim_key") g_aim_key = geti();
+            else if (key == "tp_on") g_tp_on = geti() != 0;
+            else if (key == "tp_distance") g_tp_distance = getf();
+            else if (key == "tp_height") g_tp_height = getf();
+            else if (key == "no_recoil") g_no_recoil = geti() != 0;
+            else if (key == "no_spread") g_no_spread = geti() != 0;
+            else if (key == "rapid_fire") g_rapid_fire = geti() != 0;
+            else if (key == "wv_recoil") weapon::g_val_recoil = getf();
+            else if (key == "wv_kick") weapon::g_val_kick = getf();
+            else if (key == "wv_accuracy") weapon::g_val_accuracy = getf();
+            else if (key == "wv_cooldown") weapon::g_val_cooldown = getf();
+            else if (key == "rapid_pe") g_rapid_pe_on = geti() != 0;
+            else if (key == "rapid_pe_rate") g_rapid_pe_rate = getf();
+            else if (key == "speed_on") g_speedhack_on = geti() != 0;
+            else if (key == "speed_val") g_speedhack_val = getf();
+            else if (key == "speed_key") g_speed_key = geti();
+            else if (key == "noclip") g_noclip_on = geti() != 0;
+            else if (key == "noclip_key") g_noclip_key = geti();
+            else if (key == "noclip_speed") noclip::g_fly_speed = getf();
+            else if (key == "infjump") g_infjump_on = geti() != 0;
+            else if (key == "infjump_key") g_infjump_key = geti();
+            else if (key == "infhealth") g_infhealth_on = geti() != 0;
+            else if (key == "infhealth_val") g_infhealth_val = geti();
+            else if (key == "infammo") g_infammo_on = geti() != 0;
+            else if (key == "infammo_val") g_infammo_val = geti();
+            else if (key == "items_on") items::g_on = geti() != 0;
+            else if (key == "items_max_dist") items::g_max_dist = getf();
+            else if (key == "items_line") items::g_draw_line = geti() != 0;
+            else if (key == "items_names") items::g_show_names = geti() != 0;
+            else if (key == "items_keycard") items::g_show_keycard = geti() != 0;
+            else if (key == "items_money") items::g_show_money = geti() != 0;
+            else if (key == "items_valuable") items::g_show_valuable = geti() != 0;
+            else if (key == "items_objective") items::g_show_objective = geti() != 0;
+            else if (key == "items_ammo") items::g_show_ammo = geti() != 0;
+            else if (key == "items_weapon") items::g_show_weapon = geti() != 0;
+            else if (key == "items_tool") items::g_show_tool = geti() != 0;
+            else if (key == "items_camera") items::g_show_camera = geti() != 0;
+            else if (key == "items_vault") items::g_show_vault = geti() != 0;
+            else if (key == "items_utility") items::g_show_utility = geti() != 0;
+            else if (key == "items_secroom") items::g_show_security_room = geti() != 0;
+            else if (key == "chams_mode") chams::g_mode = geti();
+            else if (key == "chams_only_visible") chams::g_only_visible = geti() != 0;
+            else if (key == "chams_stencil") chams::g_stencil = geti();
+            else if (key == "prog_cash_val") progression::g_cash_value = geti();
+            else if (key == "prog_xp_val") progression::g_xp_value = getf();
+            else if (key == "prog_level_val") progression::g_level_value = geti();
+            else if (key == "prog_sustain_cash") progression::g_sustain_cash = geti() != 0;
+            else if (key == "prog_sustain_xp") progression::g_sustain_xp = geti() != 0;
+            else if (key == "stealth_on") stealth::g_on = geti() != 0;
+        }
+        return true;
+    }
+
+    struct PickResult { esp::Vec3 pos{}; ue4::UObject* actor = nullptr; bool found = false; };
+    inline PickResult pick_target() {
+        PickResult r{};
+        if (!chain::world()) return r;
+        esp::Vec3 cam_loc{}; esp::Rot cam_rot{}; float cam_fov = 0.f;
+        if (!esp::read_camera(cam_loc, cam_rot, cam_fov)) return r;
+        auto* me_pawn = chain::local_pawn();
+        auto* pc = chain::local_pc();
+        auto* arr = actors::get_actors();
+        if (!arr) return r;
+        uintptr_t arr_addr = reinterpret_cast<uintptr_t>(arr);
+        int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+        uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+        float cx = g_screen_w * 0.5f, cy = g_screen_h * 0.5f;
+        float fov_px = (g_aim_fov / 90.f) * g_screen_w;
+        float best_d2 = fov_px * fov_px;
+        for (int i = 0; i < n; ++i) {
+            uintptr_t actor_ptr = safe_read_uintptr(reinterpret_cast<void*>(data), i * 8);
+            if (!sane_ptr(reinterpret_cast<void*>(actor_ptr))) continue;
+            auto* actor = reinterpret_cast<ue4::UObject*>(actor_ptr);
+            esp::Cat c = esp::target_category(actor, me_pawn);
+            if (c == esp::Cat::Skip) continue;
+            if (!cat_enabled(c)) continue;
+            esp::Vec3 wp{};
+            if (!esp::object_location(actor, wp)) continue;
+            wp.z += g_aim_height;
+            esp::Vec3 scr{};
+            if (!esp::world_to_screen(wp, scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov)) continue;
+            if (!esp::on_screen(scr)) continue;
+            if (g_aim_los && chain::g_los_fn &&
+                !chain::has_los_cached(pc, actor, cam_loc.x, cam_loc.y, cam_loc.z)) continue;
+            float dx = scr.x - cx, dy = scr.y - cy;
+            float d2 = dx * dx + dy * dy;
+            if (d2 < best_d2) { best_d2 = d2; r.pos = wp; r.actor = actor; r.found = true; }
+        }
+        return r;
+    }
+    inline ue4::UObject* g_aim_locked_actor = nullptr;
+    inline void tick_aimbot() {
+        if (!g_aim_on) { g_aim_locked_actor = nullptr; return; }
+        bool hold_engaged = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        bool should_run = g_aim_always ? g_aim_on : (hold_engaged || g_aim_on);
+        if (!should_run) { g_aim_locked_actor = nullptr; return; }
+        auto picked = pick_target();
+        if (picked.found) {
+            esp::Vec3 cam_loc{}; esp::Rot cam_rot{}; float cam_fov = 0.f;
+            if (esp::read_camera(cam_loc, cam_rot, cam_fov)) {
+                aim::Rot want = aim::look_at(cam_loc, picked.pos);
+                silent::pitch = want.pitch; silent::yaw = want.yaw; silent::valid = true;
+                bool is_new = (picked.actor != g_aim_locked_actor);
+                if (is_new) {
+                    g_aim_locked_actor = picked.actor;
+                    if (g_aim_instant_lock && !g_aim_silent) { aim::set_control_rotation(want); return; }
+                }
+                if (g_aim_silent) return;
+                aim::Rot cur = aim::get_control_rotation();
+                aim::Rot applied;
+                if (g_aim_snap) applied = want;
+                else {
+                    float t = (g_aim_smooth <= 1.f) ? 1.f : (1.f / g_aim_smooth);
+                    applied = aim::lerp(cur, want, t);
+                }
+                aim::set_control_rotation(applied);
+            }
+        }
+        else { silent::valid = false; g_aim_locked_actor = nullptr; }
+    }
+
+    inline void draw_esp() {
+        if (!chain::world()) return;
+        if (!g_esp_on && !g_aim_on) return;
+        esp::Vec3 cam_loc{}; esp::Rot cam_rot{}; float cam_fov = 0.f;
+        if (!esp::read_camera(cam_loc, cam_rot, cam_fov)) return;
+        auto* me_pawn = chain::local_pawn();
+        auto* pc = chain::local_pc();
+        auto* arr = actors::get_actors();
+        ImDrawList* dl = ImGui::GetBackgroundDrawList();
+        const float cx = g_screen_w * 0.5f;
+        const float cy = g_screen_h * 0.5f;
+        if (g_aim_on && g_aim_show_fov_circle) {
+            float fov_px = (g_aim_fov / 90.f) * g_screen_w;
+            dl->AddCircle({ cx, cy }, fov_px, IM_COL32(255, 200, 80, 180), 64, 1.5f);
+            dl->AddCircle({ cx, cy }, fov_px * 0.5f, IM_COL32(255, 200, 80, 90), 64, 1.0f);
+        }
+        if (!g_esp_on) return;
+        if (arr) {
+            uintptr_t arr_addr = reinterpret_cast<uintptr_t>(arr);
+            int32_t n = safe_read_i32(reinterpret_cast<void*>(arr_addr), 8);
+            uintptr_t data = safe_read_uintptr(reinterpret_cast<void*>(arr_addr), 0);
+            const float max_d2 = g_esp_max_dist * g_esp_max_dist;
+            for (int i = 0; i < n; ++i) {
+                uintptr_t actor_ptr = safe_read_uintptr(reinterpret_cast<void*>(data), i * 8);
+                if (!sane_ptr(reinterpret_cast<void*>(actor_ptr))) continue;
+                auto* actor = reinterpret_cast<ue4::UObject*>(actor_ptr);
+                esp::Cat c = esp::target_category(actor, me_pawn);
+                if (c == esp::Cat::Skip) continue;
+                if (!cat_enabled(c)) continue;
+                esp::Vec3 wp{};
+                if (!esp::object_location(actor, wp)) continue;
+                float ddx = wp.x - cam_loc.x, ddy = wp.y - cam_loc.y, ddz = wp.z - cam_loc.z;
+                float d2cm = (ddx * ddx + ddy * ddy + ddz * ddz) / 10000.f;
+                if (d2cm > max_d2 || d2cm < 0.25f) continue;
+                float dist = sqrtf(d2cm);
+                esp::Vec3 head_w = wp; head_w.z += g_esp_head_off;
+                esp::Vec3 feet_w = wp; feet_w.z += g_esp_feet_off;
+                esp::Vec3 h_scr{}, f_scr{};
+                if (!esp::world_to_screen(head_w, h_scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov)) continue;
+                if (!esp::world_to_screen(feet_w, f_scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov)) continue;
+                bool visible = true;
+                if (chain::g_los_fn) visible = chain::has_los_cached(pc, actor, cam_loc.x, cam_loc.y, cam_loc.z);
+                if (g_esp_visible && !visible) continue;
+                float box_h = f_scr.y - h_scr.y;
+                if (box_h < 4.f || box_h > g_esp_max_box_px) continue;
+                float box_w = box_h * 0.5f;
+                float x = h_scr.x - box_w * 0.5f;
+                float y = h_scr.y;
+                int cm = chams::g_mode;
+                if (cm == (int)chams::Mode::Fill || cm == (int)chams::Mode::DepthFill) {
+                    if (!chams::g_only_visible || visible) {
+                        ImU32 col = visible ? chams::g_color_visible : chams::g_color_hidden;
+                        dl->AddRectFilled({ x, y }, { x + box_w, y + box_h }, col);
+                    }
+                }
+                if (cm == (int)chams::Mode::DepthFill || cm == (int)chams::Mode::DepthOnly) {
+                    chams::apply_to(actor, visible);
+                }
+                if (g_esp_camera) {
+                    dl->AddLine({ cx, cy }, { h_scr.x, h_scr.y }, IM_COL32(80, 200, 255, 160), 1.0f);
+                    dl->AddCircle({ h_scr.x, h_scr.y }, 3.f, IM_COL32(80, 200, 255, 220), 8, 1.2f);
+                }
+                if (g_esp_box) {
+                    ImU32 col = visible ? IM_COL32(0, 255, 120, 220) : IM_COL32(255, 60, 60, 220);
+                    dl->AddRect({ x, y }, { x + box_w, y + box_h }, col, 0.f, 0, 1.5f);
+                }
+                if (g_esp_show_names) {
+                    const std::string& cls = ue4::cached_name_of(actor);
+                    if (!cls.empty()) {
+                        ImVec2 sz = ImGui::CalcTextSize(cls.c_str());
+                        ImVec2 np = { h_scr.x - sz.x * 0.5f, y - 32.f };
+                        dl->AddText({ np.x + 1.f, np.y + 1.f }, IM_COL32(0, 0, 0, 220), cls.c_str());
+                        dl->AddText(np, IM_COL32(255, 220, 100, 240), cls.c_str());
+                    }
+                }
+                if (g_esp_distance) {
+                    char lbl[64]{};
+                    snprintf(lbl, sizeof(lbl), "%.0fm", dist);
+                    dl->AddText({ x, y - 16.f }, IM_COL32(255, 255, 255, 220), lbl);
+                }
+            }
+        }
+        if (g_esp_self && me_pawn) {
+            esp::Vec3 wp{};
+            if (esp::object_location(me_pawn, wp)) {
+                esp::Vec3 head_w = wp; head_w.z += g_esp_head_off;
+                esp::Vec3 feet_w = wp; feet_w.z += g_esp_feet_off;
+                esp::Vec3 h_scr{}, f_scr{};
+                if (esp::world_to_screen(head_w, h_scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov) &&
+                    esp::world_to_screen(feet_w, f_scr, g_screen_w, g_screen_h, cam_loc, cam_rot, cam_fov)) {
+                    float box_h = f_scr.y - h_scr.y;
+                    float box_w = box_h * 0.5f;
+                    float x = h_scr.x - box_w * 0.5f;
+                    float y = h_scr.y;
+                    dl->AddRect({ x, y }, { x + box_w, y + box_h }, IM_COL32(255, 80, 80, 255), 0.f, 0, 2.f);
+                    dl->AddText({ x, y - 16.f }, IM_COL32(255, 80, 80, 255), "SELF");
+                }
+            }
+        }
+    }
+    inline void draw_items() { items::draw(); }
+} // namespace features
+
+namespace pehook {
+    using PE_t = void(*)(ue4::UObject*, ue4::UObject*, void*);
+    inline PE_t o_process_event = nullptr;
+    inline ue4::UObject* fn_get_camera_view = nullptr;
+    inline ue4::UObject* fn_fire = nullptr;
+    inline ue4::UObject* fn_server_fire = nullptr;
+    inline bool name_is_fire(const std::string& s) {
+        return s == "Fire" || s == "ServerFire" || s == "FireWeapon" ||
+            s == "ServerFireWeapon" || s == "StartFire" || s == "K2_Fire" ||
+            s == "WeaponFire" || s == "FireShot" || s == "ServerFireShot";
+    }
+    inline void cache_fire_fns() {
+        if (fn_get_camera_view && fn_fire) return;
+        auto* cam = esp::camera_manager();
+        if (cam && !fn_get_camera_view) fn_get_camera_view = chain::resolve_on_chain(cam, "GetCameraView");
+        auto* pc = chain::local_pc();
+        if (pc && !fn_fire) {
+            uintptr_t cls = safe_read_uintptr(pc, off::UObject_Class);
+            int depth = 0;
+            while (cls && depth++ < 32) {
+                uintptr_t child = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_Children);
+                int cc = 0;
+                while (child && cc++ < 2000) {
+                    ue4::FName n{};
+                    if (!smemcpy(&n, reinterpret_cast<void*>(child + off::UObject_Name), sizeof(n))) break;
+                    const std::string& s = ue4::name_to_string_cached(n);
+                    if (!fn_fire && name_is_fire(s)) fn_fire = reinterpret_cast<ue4::UObject*>(child);
+                    if (!fn_server_fire && s == "ServerFire") fn_server_fire = reinterpret_cast<ue4::UObject*>(child);
+                    child = safe_read_uintptr(reinterpret_cast<void*>(child), off::UField_Next);
+                }
+                cls = safe_read_uintptr(reinterpret_cast<void*>(cls), off::UStruct_SuperStruct);
+            }
+        }
+    }
+    inline void __fastcall detour(ue4::UObject* obj, ue4::UObject* fn, void* params) {
+        if (!o_process_event) return;
+        if (fn) {
+            ue4::FName fn_name{};
+            if (smemcpy(&fn_name, reinterpret_cast<uint8_t*>(fn) + 0x18, sizeof(fn_name))) {
+                if (stealth::is_target(fn_name.comparison_index)) return;
+                if (features::g_debug_pe) {
+                    const std::string& s = ue4::name_to_string_cached(fn_name);
+                    if (!s.empty() && s.size() < 40) dbg("PE: %s", s.c_str());
+                }
+                if (recoil::intercept(fn, params)) return;
+                bool is_fire = (fn == fn_fire || fn == fn_server_fire);
+                if (is_fire && features::g_aim_silent && features::g_aim_on && silent::valid) {
+                    auto* pc = chain::local_pc();
+                    if (pc) {
+                        aim::Rot saved = aim::get_control_rotation();
+                        aim::Rot want{ silent::pitch, silent::yaw, 0.f };
+                        aim::set_control_rotation(want);
+                        o_process_event(obj, fn, params);
+                        aim::set_control_rotation(saved);
+                        return;
+                    }
+                }
+                if (features::g_tp_on && fn == fn_get_camera_view && params) {
+                    o_process_event(obj, fn, params);
+                    uint8_t* base = reinterpret_cast<uint8_t*>(params);
+                    float* loc = reinterpret_cast<float*>(base + 0x08);
+                    float* rot = reinterpret_cast<float*>(base + 0x08 + 0x0C);
+                    float pitch = rot[0] * 3.14159265f / 180.f;
+                    float yaw = rot[1] * 3.14159265f / 180.f;
+                    loc[0] -= cosf(pitch) * cosf(yaw) * features::g_tp_distance;
+                    loc[1] -= cosf(pitch) * sinf(yaw) * features::g_tp_distance;
+                    loc[2] -= sinf(pitch) * features::g_tp_distance;
+                    loc[2] += features::g_tp_height;
+                    return;
+                }
+            }
+        }
+        o_process_event(obj, fn, params);
+    }
+    inline void install() {
+        void* addr = reinterpret_cast<void*>(ue4::base + off::ProcessEvent);
+        MH_STATUS st = MH_CreateHook(addr, &detour, reinterpret_cast<LPVOID*>(&o_process_event));
+        if (st != MH_OK) return;
+        MH_EnableHook(addr);
+    }
+} // namespace pehook
+
+namespace overlay {
+    using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
+    using ResizeBuffersFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+    static PresentFn       o_present = nullptr;
+    static ResizeBuffersFn o_resize_buffers = nullptr;
+    static WNDPROC         o_wndproc = nullptr;
+    static bool            g_show = true;
+    static bool            g_imgui_active = false;
+    static bool            g_copy_flash = false;
+    static DWORD           g_copy_flash_until = 0;
+
+    static LRESULT CALLBACK hk_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+        if (g_show) {
+            ImGui_ImplWin32_WndProcHandler(h, m, w, l);
+            if (g_imgui_active) return true;
+        }
+        return CallWindowProc(o_wndproc, h, m, w, l);
+    }
+    static HRESULT __stdcall hk_resize_buffers(IDXGISwapChain* sc, UINT bc, UINT w, UINT h, DXGI_FORMAT fmt, UINT flags) {
+        if (g_ctx) { g_ctx->OMSetRenderTargets(0, nullptr, nullptr); g_ctx->Flush(); }
+        if (g_rtv) { g_rtv->Release(); g_rtv = nullptr; }
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+        HRESULT hr = o_resize_buffers(sc, bc, w, h, fmt, flags);
+        if (SUCCEEDED(hr)) ImGui_ImplDX11_CreateDeviceObjects();
+        return hr;
+    }
+    static void keybind_button(const char* id, int& key, bool& listen) {
+        if (listen) { ImGui::Button("press any key...", ImVec2(150, 0)); return; }
+        char label[64];
+        const char* kname = nullptr;
+        switch (key) {
+        case VK_LBUTTON: kname = "Mouse1"; break;
+        case VK_RBUTTON: kname = "Mouse2"; break;
+        case VK_MBUTTON: kname = "Mouse3"; break;
+        case VK_XBUTTON1: kname = "Mouse4"; break;
+        case VK_XBUTTON2: kname = "Mouse5"; break;
+        }
+        if (kname) snprintf(label, sizeof(label), "%s  (change)", kname);
+        else {
+            UINT sc = MapVirtualKeyA(key, MAPVK_VK_TO_VSC);
+            char keyname[32]{};
+            if (sc && GetKeyNameTextA((LONG)(sc << 16), keyname, sizeof(keyname)))
+                snprintf(label, sizeof(label), "%s  (change)", keyname);
+            else snprintf(label, sizeof(label), "VK 0x%02X  (change)", key);
+        }
+        char final_label[96];
+        snprintf(final_label, sizeof(final_label), "%s##%s", label, id);
+        if (ImGui::Button(final_label, ImVec2(150, 0))) listen = true;
+    }
+    static LRESULT CALLBACK dummy_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) { return DefWindowProc(h, m, w, l); }
+    static HWND create_dummy_window() {
+        static bool registered = false;
+        const wchar_t* kClass = L"__fh_dummy_wnd";
+        if (!registered) {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = dummy_wndproc;
+            wc.hInstance = GetModuleHandleA(nullptr);
+            wc.lpszClassName = kClass;
+            if (!RegisterClassExW(&wc)) return nullptr;
+            registered = true;
+        }
+        return CreateWindowExW(0, kClass, L"", WS_OVERLAPPEDWINDOW, 0, 0, 8, 8,
+            nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+    }
+    static void* try_create_swapchain_vtable(D3D_DRIVER_TYPE type, HWND hwnd, HRESULT& out_hr) {
+        DXGI_SWAP_CHAIN_DESC sd{};
+        sd.BufferCount = 1;
+        sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        sd.BufferDesc.RefreshRate.Numerator = 60; sd.BufferDesc.RefreshRate.Denominator = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.OutputWindow = hwnd;
+        sd.SampleDesc.Count = 1;
+        sd.Windowed = TRUE;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        ID3D11Device* dev = nullptr;
+        ID3D11DeviceContext* ctx = nullptr;
+        IDXGISwapChain* sc = nullptr;
+        D3D_FEATURE_LEVEL fl{};
+        out_hr = D3D11CreateDeviceAndSwapChain(nullptr, type, nullptr, 0, nullptr, 0,
+            D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx);
+        if (FAILED(out_hr) || !sc) {
+            if (sc) sc->Release(); if (ctx) ctx->Release(); if (dev) dev->Release();
+            return nullptr;
+        }
+        void** vtable = *reinterpret_cast<void***>(sc);
+        void* result = (void*)vtable;
+        sc->Release(); ctx->Release(); dev->Release();
+        return result;
+    }
+
+    static HRESULT __stdcall hk_present(IDXGISwapChain* sc, UINT sync, UINT flags) {
+        if (!g_dev) {
+            sc->GetDevice(__uuidof(ID3D11Device), (void**)&g_dev);
+            if (!g_dev) return o_present(sc, sync, flags);
+            g_dev->GetImmediateContext(&g_ctx);
+            DXGI_SWAP_CHAIN_DESC d; sc->GetDesc(&d);
+            g_hwnd = d.OutputWindow;
+            RECT rc{}; GetClientRect(g_hwnd, &rc);
+            g_screen_w = rc.right; g_screen_h = rc.bottom;
+            ImGui::CreateContext();
+            ImGui_ImplWin32_Init(g_hwnd);
+            ImGui_ImplDX11_Init(g_dev, g_ctx);
+            o_wndproc = (WNDPROC)SetWindowLongPtr(g_hwnd, GWLP_WNDPROC, (LONG_PTR)hk_wndproc);
+        }
+        if (!g_rtv) {
+            ID3D11Texture2D* bb = nullptr;
+            if (SUCCEEDED(sc->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb)) && bb) {
+                g_dev->CreateRenderTargetView(bb, nullptr, &g_rtv);
+                bb->Release();
+            }
+        }
+
+        chain::los_cache::begin_frame();
+        esp::begin_frame();
+        seh_guard(&chain::init_los);
+        seh_guard(&pehook::cache_fire_fns);
+        seh_guard(&stealth::resolve);
+        seh_guard(&chams::resolve);
+        seh_guard(&skins::resolve);
+        seh_guard(&skybox::resolve);
+        seh_guard(&features::tick_keybinds);
+        seh_guard(&features::tick_weapon);
+        seh_guard(&features::tick_movement);
+        seh_guard(&features::tick_combat);
+        seh_guard(&progression::resolve_functions);
+        seh_guard(&progression::tick_sustain);
+        seh_guard(&skins::tick_reapply);
+        seh_guard(&skybox::tick_reapply);
+
+        esp::g_dead_filter_enabled = features::g_esp_hide_dead;
+        if (GetAsyncKeyState(VK_INSERT) & 1) g_show = !g_show;
+        seh_guard(&features::tick_aimbot);
+
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
+        g_imgui_active = g_show && (ImGui::GetIO().WantCaptureMouse || ImGui::GetIO().WantCaptureKeyboard);
+        seh_guard(&features::draw_esp);
+        seh_guard(&features::draw_items);
+
+        if (g_show) {
+            ImGui::SetNextWindowPos({ 100, 100 }, ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowSize({ 820, 880 }, ImGuiCond_FirstUseEver);
+            ImGui::Begin(CHEAT_NAME "###hax");
+            if (ImGui::Button("Hide (Insert)")) g_show = false;
+            ImGui::SameLine(); ImGui::TextDisabled("Insert = toggle");
+            ImGui::SameLine(); ImGui::TextDisabled("| %s", build_info::VERSION);
+            ImGui::Separator();
+            if (ImGui::BeginTabBar("tabs", ImGuiTabBarFlags_None)) {
+
+                if (ImGui::BeginTabItem("Visuals")) {
+                    ImGui::Checkbox("ESP", &features::g_esp_on);
+                    ImGui::SameLine(); ImGui::Checkbox("Box", &features::g_esp_box);
+                    ImGui::SameLine(); ImGui::Checkbox("Distance", &features::g_esp_distance);
+                    ImGui::SameLine(); ImGui::Checkbox("Camera line", &features::g_esp_camera);
+                    ImGui::Checkbox("Visible (LOS)", &features::g_esp_visible);
+                    ImGui::SameLine(); ImGui::Checkbox("Self preview", &features::g_esp_self);
+                    ImGui::Checkbox("Hide dead", &features::g_esp_hide_dead);
+                    ImGui::SameLine(); ImGui::Checkbox("Show NPC names", &features::g_esp_show_names);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reset death tracking##rdt")) esp::dead_track::clear_all();
+                    ImGui::SliderFloat("Max dist (m)", &features::g_esp_max_dist, 20.f, 500.f);
+                    ImGui::SliderFloat("Head offset", &features::g_esp_head_off, -20.f, 150.f);
+                    ImGui::SliderFloat("Feet offset", &features::g_esp_feet_off, -150.f, 20.f);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Guards", &features::g_cat_guard);
+                    ImGui::SameLine(); ImGui::Checkbox("Police", &features::g_cat_police);
+                    ImGui::SameLine(); ImGui::Checkbox("Civilians", &features::g_cat_civilian);
+                    ImGui::SameLine(); ImGui::Checkbox("Other NPC", &features::g_cat_other);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Enable third person", &features::g_tp_on);
+                    ImGui::SliderFloat("Distance##tp", &features::g_tp_distance, 50.f, 500.f);
+                    ImGui::SliderFloat("Height##tp", &features::g_tp_height, -100.f, 200.f);
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Chams");
+                    static const char* kChamsModes[] = { "Off", "Fill", "Fill + Depth", "Depth only" };
+                    ImGui::Combo("Mode##chamsm", &chams::g_mode, kChamsModes, 4);
+                    ImGui::Checkbox("Only visible##chamso", &chams::g_only_visible);
+                    ImGui::SliderInt("Stencil##chamss", &chams::g_stencil, 1, 254);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Aimbot")) {
+                    ImGui::Checkbox("Enabled (hotkey toggles)", &features::g_aim_on);
+                    ImGui::SameLine(); ImGui::Checkbox("Always on", &features::g_aim_always);
+                    ImGui::TextUnformatted("Hotkey:"); ImGui::SameLine();
+                    keybind_button("aim", features::g_aim_key, features::g_aim_listen);
+                    ImGui::SameLine(); ImGui::TextDisabled("state: %s", features::g_aim_on ? "ON" : "off");
+                    ImGui::Separator();
+                    ImGui::Checkbox("Snap", &features::g_aim_snap);
+                    ImGui::Checkbox("Instant lock", &features::g_aim_instant_lock);
+                    ImGui::Checkbox("Silent aim", &features::g_aim_silent);
+                    ImGui::Checkbox("Requires LOS", &features::g_aim_los);
+                    ImGui::Checkbox("Show FOV circle", &features::g_aim_show_fov_circle);
+                    ImGui::SliderFloat("FOV", &features::g_aim_fov, 1.f, 30.f);
+                    ImGui::SliderFloat("Smooth", &features::g_aim_smooth, 1.f, 15.f);
+                    ImGui::SliderFloat("Aim height", &features::g_aim_height, -50.f, 150.f);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Weapon")) {
+                    ImGui::Checkbox("No recoil", &features::g_no_recoil);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(220.f);
+                    ImGui::SliderFloat("##recoilval", &weapon::g_val_recoil, -1.f, 1.f, "recoil = %.4f");
+                    ImGui::Checkbox("No spread", &features::g_no_spread);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(220.f);
+                    ImGui::SliderFloat("##accval", &weapon::g_val_accuracy, 1.f, 500.f, "accuracy = %.1f", ImGuiSliderFlags_Logarithmic);
+                    ImGui::Checkbox("Rapid fire", &features::g_rapid_fire);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(220.f);
+                    ImGui::SliderFloat("##cdval", &weapon::g_val_cooldown, 0.001f, 0.5f, "cooldown = %.4f", ImGuiSliderFlags_Logarithmic);
+                    ImGui::Separator();
+                    if (ImGui::Button("Dump weapon")) weapon::dump_weapon();
+                    ImGui::Separator();
+                    ImGui::Checkbox("Rapid fire (PE invoke)", &features::g_rapid_pe_on);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderFloat("##rapidrate", &features::g_rapid_pe_rate, 1.f, 60.f, "%.0f shots/s");
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Combat")) {
+                    ImGui::Checkbox("Infinite Health", &features::g_infhealth_on);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(220.f);
+                    ImGui::InputInt("##hpval", &features::g_infhealth_val, 100, 10000);
+                    ImGui::Checkbox("Infinite Ammo", &features::g_infammo_on);
+                    ImGui::SameLine(); ImGui::SetNextItemWidth(220.f);
+                    ImGui::InputInt("##ammoval", &features::g_infammo_val, 100, 1000);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Stealth")) {
+                    ImGui::Checkbox("Enable##stealth", &stealth::g_on);
+                    ImGui::SameLine(); ImGui::TextDisabled("resolved: %d", stealth::g_cmp_count);
+                    ImGui::Separator();
+                    ImGui::Checkbox("OnPlayerSeen / Spot events", &stealth::g_filter_onseen);
+                    ImGui::Checkbox("Report*", &stealth::g_filter_report);
+                    ImGui::Checkbox("Detect* / Spot*", &stealth::g_filter_detect);
+                    ImGui::Checkbox("CanSee*", &stealth::g_filter_cansee);
+                    ImGui::Checkbox("Misc", &stealth::g_filter_misc);
+                    ImGui::Separator();
+                    if (ImGui::Button("Dump stealth##sd")) stealth::dump_sensing_fns();
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Movement")) {
+                    ImGui::Checkbox("Enable speedhack", &features::g_speedhack_on);
+                    ImGui::SameLine(); ImGui::TextUnformatted("Bind:");
+                    ImGui::SameLine(); keybind_button("speedkey", features::g_speed_key, features::g_speed_listen);
+                    ImGui::SetNextItemWidth(300.f);
+                    ImGui::SliderFloat("##speed", &features::g_speedhack_val, 0.1f, 8.0f, "mult = %.2fx", ImGuiSliderFlags_Logarithmic);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Enable noclip", &features::g_noclip_on);
+                    ImGui::SameLine(); ImGui::TextUnformatted("Bind:");
+                    ImGui::SameLine(); keybind_button("noclipkey", features::g_noclip_key, features::g_noclip_listen);
+                    ImGui::SetNextItemWidth(300.f);
+                    ImGui::SliderFloat("##noclipspeed", &noclip::g_fly_speed, 600.f, 6000.f, "fly = %.0f");
+                    ImGui::Separator();
+                    ImGui::Checkbox("Enable infinite jump", &features::g_infjump_on);
+                    ImGui::SameLine(); ImGui::TextUnformatted("Bind:");
+                    ImGui::SameLine(); keybind_button("infjumpkey", features::g_infjump_key, features::g_infjump_listen);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Items")) {
+                    ImGui::Checkbox("Enable item ESP", &items::g_on);
+                    ImGui::SetNextItemWidth(300.f);
+                    ImGui::SliderFloat("Max distance (m)", &items::g_max_dist, 5.f, 500.f);
+                    ImGui::Checkbox("Draw line to marker", &items::g_draw_line);
+                    ImGui::SameLine(); ImGui::Checkbox("Show item names", &items::g_show_names);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Keycards", &items::g_show_keycard);
+                    ImGui::SameLine(); ImGui::Checkbox("Money", &items::g_show_money);
+                    ImGui::SameLine(); ImGui::Checkbox("Valuables", &items::g_show_valuable);
+                    ImGui::Checkbox("Objectives", &items::g_show_objective);
+                    ImGui::SameLine(); ImGui::Checkbox("Ammo", &items::g_show_ammo);
+                    ImGui::SameLine(); ImGui::Checkbox("Weapons", &items::g_show_weapon);
+                    ImGui::Checkbox("Tools", &items::g_show_tool);
+                    ImGui::Separator();
+                    ImGui::Checkbox("Cameras", &items::g_show_camera);
+                    ImGui::SameLine(); ImGui::Checkbox("Vault", &items::g_show_vault);
+                    ImGui::SameLine(); ImGui::Checkbox("Utility room", &items::g_show_utility);
+                    ImGui::SameLine(); ImGui::Checkbox("Security room", &items::g_show_security_room);
+                    ImGui::Separator();
+                    if (ImGui::Button("Dump all actors")) items::dump_all();
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Skins")) {
+                    ImGui::TextUnformatted("Client-side visual. Persists across weapon swap.");
+                    if (ImGui::Button("Scan materials##scan")) skins::g_scanned = false;
+                    ImGui::SameLine();
+                    if (ImGui::Button("Dump##skind")) skins::dump();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear applied##skc")) skins::clear_persistent();
+                    ImGui::Separator();
+                    ImGui::Text("weapon_mesh=%p  pawn_mesh=%p",
+                        (void*)skins::g_weapon_mesh, (void*)skins::g_pawn_mesh);
+                    ImGui::Text("SetMaterial=%s",
+                        skins::g_set_mat_state == 2 ? "ok" : (skins::g_set_mat_state == 1 ? "missing" : "..."));
+                    ImGui::Text("%d mats  persistent: wm=%s pm=%s",
+                        skins::g_mat_count,
+                        skins::g_persistent_weapon_mat ? "set" : "no",
+                        skins::g_persistent_pawn_mat ? "set" : "no");
+                    ImGui::Separator();
+                    if (!skins::g_scanned) skins::scan_assets();
+                    ImGui::Text("Material filter:");
+                    ImGui::SetNextItemWidth(300.f);
+                    ImGui::InputText("##matfilt", skins::g_mat_filter, sizeof(skins::g_mat_filter));
+                    ImGui::BeginChild("matlist", { 0, 200 }, true);
+                    int mat_shown = 0;
+                    for (int i = 0; i < skins::g_mat_count && mat_shown < 500; ++i) {
+                        if (skins::g_mat_filter[0] &&
+                            skins::g_mat_assets[i].name.find(skins::g_mat_filter) == std::string::npos) continue;
+                        bool sel = (i == skins::g_mat_sel);
+                        char lbl[256];
+                        snprintf(lbl, sizeof(lbl), "[%d] %s  (%s)",
+                            i, skins::g_mat_assets[i].name.c_str(), skins::g_mat_assets[i].cls.c_str());
+                        if (ImGui::Selectable(lbl, sel)) skins::g_mat_sel = i;
+                        mat_shown++;
+                    }
+                    ImGui::EndChild();
+                    if (ImGui::Button("Apply mat to weapon##awm")) skins::apply_weapon_material();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Apply mat to body##abm")) skins::apply_pawn_material();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("sel=%d", skins::g_mat_sel);
+
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Weapons");
+                    if (!skins::g_weapons_scanned) skins::scan_weapons();
+                    if (ImGui::Button("Rescan weapons##rsw")) {
+                        skins::g_weapons_scanned = false;
+                        skins::g_weapon_count = 0;
+                        skins::g_weapon_sel = -1;
+                        skins::scan_weapons();
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("%d weapons", skins::g_weapon_count);
+                    ImGui::BeginChild("weplist", { 0, 180 }, true);
+                    for (int i = 0; i < skins::g_weapon_count; ++i) {
+                        bool sel = (i == skins::g_weapon_sel);
+                        char lbl[128];
+                        snprintf(lbl, sizeof(lbl), "%s##w%d", skins::g_weapons[i].display_name.c_str(), i);
+                        if (ImGui::Selectable(lbl, sel)) skins::g_weapon_sel = i;
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("%s", skins::g_weapons[i].raw_name.c_str());
+                    }
+                    ImGui::EndChild();
+                    if (ImGui::Button("Apply material to selected weapon##amsw"))
+                        skins::apply_material_to_selected_weapon();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("sel=%s",
+                        (skins::g_weapon_sel >= 0 && skins::g_weapon_sel < skins::g_weapon_count)
+                        ? skins::g_weapons[skins::g_weapon_sel].display_name.c_str()
+                        : "(none)");
+
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Skybox");
+                    ImGui::Text("sky_actor=%p  sky_mesh=%p  state=%d",
+                        (void*)skybox::g_sky_actor, (void*)skybox::g_sky_mesh, skybox::g_scan_state);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Rescan##skyr")) { skybox::g_scan_state = 0; skybox::g_sky_actor = nullptr; skybox::g_sky_mesh = 0; }
+                    ImGui::SetNextItemWidth(200.f);
+                    ImGui::SliderInt("Slot##skyslot", &skybox::g_mat_slot, 0, 8);
+                    ImGui::SetNextItemWidth(300.f);
+                    ImGui::InputText("Sky filter##skyf", skybox::g_mat_filter, sizeof(skybox::g_mat_filter));
+                    ImGui::BeginChild("skylist", { 0, 120 }, true);
+                    int sky_shown = 0;
+                    for (int i = 0; i < skins::g_mat_count && sky_shown < 500; ++i) {
+                        if (skybox::g_mat_filter[0] &&
+                            skins::g_mat_assets[i].name.find(skybox::g_mat_filter) == std::string::npos) continue;
+                        bool sel = (i == skybox::g_mat_sel);
+                        char lbl[256];
+                        snprintf(lbl, sizeof(lbl), "[%d] %s", i, skins::g_mat_assets[i].name.c_str());
+                        if (ImGui::Selectable(lbl, sel)) skybox::g_mat_sel = i;
+                        sky_shown++;
+                    }
+                    ImGui::EndChild();
+                    if (ImGui::Button("Apply sky material##asky")) {
+                        if (skybox::g_mat_sel >= 0 && skybox::g_mat_sel < skins::g_mat_count)
+                            skybox::apply(skins::g_mat_assets[skybox::g_mat_sel].obj);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Reset sky##rsky")) skybox::reset();
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("sel=%d", skybox::g_mat_sel);
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Progression")) {
+                    ImGui::TextUnformatted("Cash — RobberController+0x5C0");
+                    ImGui::SetNextItemWidth(220.f);
+                    ImGui::InputInt("##cashval", &progression::g_cash_value, 1000, 1000000);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Grant cash##gc")) progression::grant_cash(true);
+                    ImGui::SameLine(); ImGui::Checkbox("sustain##cas", &progression::g_sustain_cash);
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Level — RobberController+0x5B8");
+                    ImGui::SetNextItemWidth(220.f);
+                    ImGui::InputInt("##lvlval", &progression::g_level_value, 1, 10);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Grant level##gl")) progression::grant_level(true);
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("XP — PE AddEXP(float)");
+                    ImGui::SetNextItemWidth(220.f);
+                    ImGui::InputFloat("##xpval", &progression::g_xp_value, 100.f, 10000.f, "%.0f");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Grant XP##gx")) progression::grant_xp(true);
+                    ImGui::SameLine(); ImGui::Checkbox("sustain##xs", &progression::g_sustain_xp);
+                    ImGui::Separator();
+                    if (ImGui::Button("Dump progression##dp")) progression::dump();
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Save")) {
+                    ImGui::TextUnformatted("Target: %LOCALAPPDATA%\\OAR\\Saved\\SaveGames");
+                    ImGui::Text("username: %s", sav_gen::get_username().c_str());
+                    ImGui::Text("folder:   %s",
+                        sav_gen::g_folder.empty() ? "(not yet resolved)" : sav_gen::g_folder.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("rescan##sfr")) {
+                        sav_gen::g_folder_scanned = false;
+                        sav_gen::scan_folder();
+                    }
+                    ImGui::Text("sav files present: %d", sav_gen::g_sav_verify_count);
+                    ImGui::Separator();
+                    if (ImGui::Button("Scan folder##sf")) sav_gen::scan_folder();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Open folder##of")) sav_gen::open_save_folder();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Dump##sd")) sav_gen::dump();
+                    ImGui::BeginChild("savfiles", { 0, 100 }, true);
+                    if (sav_gen::g_sav_files.empty())
+                        ImGui::TextDisabled("  (no .sav files yet — click Unlock + write sav)");
+                    else
+                        for (const auto& f : sav_gen::g_sav_files)
+                            ImGui::TextDisabled("  %s", f.c_str());
+                    ImGui::EndChild();
+                    ImGui::Separator();
+                    ImGui::Text("Map candidates: %d", sav_gen::g_map_count);
+                    if (ImGui::Button("Rescan maps##rm")) { sav_gen::g_maps_scanned = false; sav_gen::scan_maps(); }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Unlock + write sav##us")) sav_gen::unlock_and_save();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Force save##fs")) sav_gen::force_save_maps();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Dump unlocked##du")) sav_gen::dump_unlocked_contents();
+                    ImGui::SameLine();
+                    if (ImGui::Button("Dump shop items##dsi")) sav_gen::dump_shop_items();
+                    ImGui::Text("AddMap=%d  SaveMaps=%d  last_result=%d",
+                        sav_gen::g_addmap_state, sav_gen::g_savemaps_state, sav_gen::g_last_result);
+                    if (sav_gen::g_addmap_state == 0) sav_gen::resolve_addmap();
+                    if (sav_gen::g_savemaps_state == 0) sav_gen::resolve_savemaps();
+                    ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("Config")) {
+                    ImGui::Text("Data folder: %s", paths::data_dir().c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button("Open##df")) {
+                        const std::string& d = paths::data_dir();
+                        if (!d.empty()) ShellExecuteA(nullptr, "open", d.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    ImGui::Text("Version: %s  |  Build: %s", build_info::VERSION, build_info::BUILD_ID);
+                    ImGui::Separator();
+                    ImGui::SetNextItemWidth(260.f);
+                    if (ImGui::InputText("##cfgname", features::g_config_name_buf, sizeof(features::g_config_name_buf)))
+                        features::g_config_name = features::g_config_name_buf;
+                    if (ImGui::Button("Save")) {
+                        bool ok = features::config_save();
+                        strncpy_s(features::g_config_status, ok ? "saved" : "FAILED", sizeof(features::g_config_status));
+                        features::g_config_flash = true;
+                        features::g_config_flash_until = GetTickCount() + 1500;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Load")) {
+                        bool ok = features::config_load();
+                        strncpy_s(features::g_config_status, ok ? "loaded" : "FAILED", sizeof(features::g_config_status));
+                        features::g_config_flash = true;
+                        features::g_config_flash_until = GetTickCount() + 1500;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Open logs")) {
+                        const std::string lp = paths::log_path();
+                        if (!lp.empty()) ShellExecuteA(nullptr, "open", lp.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+                    }
+                    if (features::g_config_flash && GetTickCount() < features::g_config_flash_until) {
+                        ImGui::SameLine();
+                        ImGui::TextColored({ 0.f, 1.f, 0.f, 1.f }, "%s!", features::g_config_status);
+                    }
+                    else features::g_config_flash = false;
+                    ImGui::Separator();
+                    ImGui::Checkbox("Debug: log ProcessEvent", &features::g_debug_pe);
+                    if (ImGui::Button("Copy log")) {
+                        if (copy_to_clipboard(features::g_log)) {
+                            g_copy_flash = true;
+                            g_copy_flash_until = GetTickCount() + 1500;
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::Button("Clear log")) features::g_log[0] = '\0';
+                    if (g_copy_flash && GetTickCount() < g_copy_flash_until) {
+                        ImGui::SameLine();
+                        ImGui::TextColored({ 0.f, 1.f, 0.f, 1.f }, "copied!");
+                    }
+                    else g_copy_flash = false;
+                    ImGui::Separator();
+                    ImGui::Text("Screen: %dx%d", g_screen_w, g_screen_h);
+                    ImGui::BeginChild("log", { 0, 160 }, true);
+                    ImGui::TextUnformatted(features::g_log);
+                    ImGui::EndChild();
+                    ImGui::EndTabItem();
+                }
+
+                ImGui::EndTabBar();
+            }
+            ImGui::End();
+        }
+
+        ImGui::Render();
+        if (g_rtv) g_ctx->OMSetRenderTargets(1, &g_rtv, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        return o_present(sc, sync, flags);
+    }
+
+    inline void install() {
+        int waited = 0;
+        while (!GetModuleHandleA("d3d11.dll")) {
+            Sleep(500); waited += 500;
+            if (waited > 120000) return;
+        }
+        HWND hwnd = create_dummy_window();
+        if (!hwnd) return;
+        struct Attempt { D3D_DRIVER_TYPE type; const char* name; };
+        static const Attempt attempts[] = {
+            { D3D_DRIVER_TYPE_NULL, "NULL" },
+            { D3D_DRIVER_TYPE_HARDWARE, "HARDWARE" },
+            { D3D_DRIVER_TYPE_WARP, "WARP" },
+        };
+        void** vtable = nullptr;
+        for (const auto& a : attempts) {
+            HRESULT hr = E_FAIL;
+            vtable = reinterpret_cast<void**>(try_create_swapchain_vtable(a.type, hwnd, hr));
+            if (vtable) break;
+        }
+        DestroyWindow(hwnd);
+        if (!vtable) return;
+        MH_STATUS st = MH_Initialize();
+        if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) return;
+        MH_CreateHook(vtable[8], &hk_present, reinterpret_cast<LPVOID*>(&o_present));
+        MH_CreateHook(vtable[13], &hk_resize_buffers, reinterpret_cast<LPVOID*>(&o_resize_buffers));
+        MH_EnableHook(MH_ALL_HOOKS);
+        pehook::install();
+        speedhack::install();
+    }
+} // namespace overlay
+
+static DWORD WINAPI main_thread(LPVOID) {
+    while (!GetModuleHandleA(nullptr)) Sleep(100);
+    ue4::base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    ue4::g_append_string = reinterpret_cast<ue4::AppendStringFn>(ue4::base + off::AppendString);
+    ue4::g_process_event = reinterpret_cast<ue4::ProcessEventFn>(ue4::base + off::ProcessEvent);
+    dbg("=== %s %s (%s) === base=0x%llX PE=%p",
+        CHEAT_NAME, build_info::VERSION, build_info::BUILD_ID,
+        ue4::base, ue4::g_process_event);
+    features::config_load();
+    sav_gen::get_username();
+    sav_gen::g_folder = sav_gen::resolve_oar_save_folder();
+    dbg("save folder resolved on inject: %s", sav_gen::g_folder.c_str());
+    overlay::install();
+    return 0;
+}
+
+BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);
+        open_console();
+        dbg("=== DllMain attach ===");
+        CreateThread(nullptr, 0, main_thread, nullptr, 0, nullptr);
+    }
+    return TRUE;
+}

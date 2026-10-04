@@ -1,0 +1,7 @@
+this cheat uses imgui and minhook unfortunately i dont freaken know how to put my visual studio folder in there so i have to put the dll and the source there
+also made by danfn1234 on discord
+pls dont cry if it doesn't work i dont understand wtf this does
+also for the maps u have to disable cloud saving
+dumper8(credits to andreu_term) for dumping the sdk
+unreal engine 4 unlocker for the injection(credits to otis_inf)
+will probably break if the game updates so i will update it when the update happens anw love for everyone enjoy the cheat while it lasts
